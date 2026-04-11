@@ -1,0 +1,21 @@
+{
+  "feeds": [
+    "https://feeds.bbci.co.uk/news/rss.xml",
+    "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"
+  ],
+  "ai": {
+    "url": "http://localhost:11434/v1",
+    "model": "gemma4:31b-it-q4_K_M",
+    "thinkingEffort": "medium",
+    "maxContextTokens": 40960
+  },
+  "aggregator": {
+    "intervalMs": 900000,
+    "workers": 2
+  },
+  "server": {
+    "port": 3001,
+    "uiDir": "./ui/build"
+  },
+  "dbPath": "./newsagg.db"
+}

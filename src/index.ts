@@ -1,0 +1,43 @@
+import { createDb } from './db/index.js'
+import { createAi } from './ai/index.js'
+import { createGrabber } from './grabber/index.js'
+import { createConsolidator } from './consolidator/index.js'
+import { createAggregator } from './aggregator/index.js'
+import { createServer } from './server/index.js'
+import { config } from './config.js'
+
+async function main() {
+  const db = createDb(config.dbPath)
+  const ai = createAi(config.ai)
+
+  const consolidator = createConsolidator({ db, ai })
+  const grabber = createGrabber({ feeds: config.feeds, onArticle: consolidator.enqueue })
+
+  // Late-bound so the callback can reference server without a circular dependency
+  let notifyFrontPage: ((userId: number, generatedAt: number) => void) | undefined
+
+  const aggregator = createAggregator({
+    db,
+    ai,
+    config: config.aggregator,
+    aiConfig: config.ai,
+    onFrontPageGenerated: (userId, generatedAt) => {
+      notifyFrontPage?.(userId, generatedAt)
+    },
+  })
+
+  const server = await createServer({ db, aggregator, config: config.server })
+  notifyFrontPage = server.notifyFrontPageGenerated.bind(server)
+
+  await server.listen()
+  grabber.start()
+  consolidator.start()
+  aggregator.start()
+
+  console.log(`newsagg running on port ${config.server.port}`)
+}
+
+main().catch((err) => {
+  console.error(err)
+  process.exit(1)
+})
