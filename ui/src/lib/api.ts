@@ -38,6 +38,7 @@ export function isLoggedIn(): boolean {
 export interface FrontPage {
   userId: number
   generatedAt: number
+  readTopicIds: number[]
   sections: {
     topicId: number
     topicTitle: string
@@ -54,7 +55,15 @@ export async function getFrontPage(): Promise<FrontPage | null> {
   return res.json() as Promise<FrontPage>
 }
 
-export async function vote(articleId: number, vote: 1 | -1): Promise<void> {
+export async function setReadTopics(topicIds: number[]): Promise<void> {
+  await fetch(`${BASE}/readtopics`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ topicIds }),
+  })
+}
+
+export async function vote(articleId: number, vote: 1 | -1 | 0): Promise<void> {
   await fetch(`${BASE}/vote`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
@@ -62,8 +71,32 @@ export async function vote(articleId: number, vote: 1 | -1): Promise<void> {
   })
 }
 
+export interface TopicArticle {
+  id: number
+  title: string
+  source: string
+  url: string
+  fetchedAt: number
+}
+
+export async function getTopicArticles(topicId: number): Promise<TopicArticle[]> {
+  const res = await fetch(`${BASE}/topics/${topicId}/articles`, { headers: authHeaders() })
+  if (!res.ok) throw new Error('Failed to load articles')
+  return res.json() as Promise<TopicArticle[]>
+}
+
+export async function ungroupArticle(topicId: number, articleId: number): Promise<{ newTopicIds: number[] }> {
+  const res = await fetch(`${BASE}/topics/${topicId}/articles/${articleId}/ungroup`, {
+    method: 'POST',
+    headers: authHeaders(),
+  })
+  if (!res.ok) throw new Error('Failed to ungroup article')
+  return res.json() as Promise<{ newTopicIds: number[] }>
+}
+
 export interface Preferences {
   intervalMs: number
+  preferenceProfile: string
 }
 
 export async function getPreferences(): Promise<Preferences> {

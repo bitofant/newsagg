@@ -20,42 +20,68 @@ A personal news aggregator that collects articles from RSS feeds, consolidates t
 
 1. **AI** (`src/ai/`) - LLM wrapper (OpenAI-compatible API, targeting Ollama)
    - Config: model name, thinking effort, URL, optional credentials, max context size
+   - **LLM call logging**: every `complete()` call writes 3 files to `llm/{YYYYMMDD}/` (gitignored): `{unix_ts}.req` (request JSON), `{unix_ts}.res` (response text), `{unix_ts}.think` (reasoning tokens, if present). Fire-and-forget, never blocks inference. Useful for debugging prompt issues or unexpected LLM output.
 
 2. **News DB** (`src/db/news.ts`) - Hierarchical article storage (SQLite)
    - High-level topic list with terse descriptions (used by consolidator for matching)
+   - Per-topic `summary` column: LLM-generated 2-3 sentence summary, created when topic reaches 2+ articles, regenerated on `substantial_new_info`
+   - Articles linked to topics via `article_topics` junction table (many-to-many); an article can belong to multiple topics
    - Per-topic article lists (topic, text, timestamp, source, ...)
 
-3. **User DB** (`src/db/users.ts`) - User management + preferences + signal queue (SQLite)
+3. **User DB** (`src/db/users.ts`) - User management + preferences + signal queue + read tracking (SQLite)
    - User profiles (email, password hash)
-   - Per-user topic interests: thumbs up/down on articles
+   - Per-user article votes: thumbs up/down persisted in `user_votes` table (one vote per user per article, upsert on change)
+   - Preference profile: LLM-generated markdown description of user interests (stored in `preference_profile` column), auto-generated from votes via debounced profiler, hand-editable in settings
    - Signal queue for consolidator → aggregator communication
+   - Read-topic tracking: `user_read_topics` table (user_id, topic_id, read_at) — tracks which topics a user has marked as read; managed atomically via `setReadTopics()`
 
 4. **News Grabber** (`src/grabber/`) - RSS feed follower
    - Monitors configured RSS feeds via `rss-parser`
    - Pushes articles to consolidator queue (sync, non-blocking)
    - No dedup — that's the consolidator's job via DB
 
-5. **Consolidator** (`src/consolidator/`) - Topic matching & signal generation
+5. **Consolidator** (`src/consolidator/`) - Topic matching, signal generation & summary generation
    - Internal async queue: `enqueue()` buffers articles, drain loop processes every 5s
    - Batches up to 10 articles, matches against topics in pages of 50 (newest first)
+   - Multi-topic matching: an article can match multiple existing topics (e.g., a roundup article covering several subjects)
    - Creates new topics or appends to existing ones
    - Enqueues signals to all users: `new_topic`, `added_to_topic`, `substantial_new_info`, `concluded_issue`
    - Combined LLM assessment: substantiality + conclusion detection in one call with topic context
+   - **Topic summary generation**: generates/regenerates a 2-3 sentence LLM summary when a topic reaches 2+ articles or when `substantial_new_info` is detected; stored in `topics.summary` column
+   - **Read-state reset on substantial news**: when `substantial_new_info` is detected, the topic's read flag is removed for all users except those who downvoted (thumbs down) an article in that topic — ensures users see important developments even if they previously marked the topic as read
+   - **Article ungrouping**: `ungroupArticle(articleId, topicId)` removes an article from a topic and re-classifies it via the same paginated LLM matching (excluding the source topic); falls back to creating a new standalone topic if no match found; cleans up empty topics
    - PLANNED: embedding-based pre-filter
 
 6. **News Aggregator** (`src/aggregator/`) - Per-user front page generation
-   - Consumes signal queue from DB per user
+   - 14-day rolling signal window: reads all signals from the last 14 days (no consumption model)
+   - Excludes topics the user has marked as read via `user_read_topics` table
+   - Up to 100 topics per front page, scored by signal priority
+   - Uses persistent topic summaries (from consolidator) or first-article text for single-article topics
    - Per-user generation interval (stored in users table, checked every 30s tick)
    - In-memory async worker pool with N configurable workers to avoid saturating Ollama
+   - If user has preference profile: single LLM call for relevance scoring (1-5) on topic titles, re-sorts by relevance
    - Front pages persisted in SQLite `front_pages` table
    - Optional `onFrontPageGenerated` callback for push notifications (used by SSE)
-   - **Status: IMPLEMENTED** — scheduling loop, worker pool, per-user intervals, AI-generated headlines/summaries, basic vote-based scoring, punt logic when overloaded
+   - Periodic cleanup: deletes signals older than 14 days (hourly)
+   - **Status: IMPLEMENTED** — scheduling loop, worker pool, per-user intervals, persistent topic summaries, preference-profile-based relevance ranking, punt logic when overloaded, read-topic exclusion
 
-7. **UI** (`ui/`) - SvelteKit + Tailwind CSS
-   - Mobile-responsive newspaper-style front page per user
+7. **Profiler** (`src/profiler/`) - User preference profile generation
+   - Debounced trigger: `onVote(userId)` resets a 15-minute timer per user
+   - When timer fires: reads vote history with article/topic context, asks LLM to generate a markdown preference description
+   - Stores result in `users.preference_profile` column
+   - Profile is editable by user in settings UI
+
+8. **UI** (`ui/`) - SvelteKit + Tailwind CSS
+   - Mobile-responsive single-column front page per user (up to 100 topics)
+   - Icons via `lucide-svelte` (tree-shakeable SVG icons, styled via Tailwind `currentColor`)
+   - Per-card vertical button column (right-aligned): read/unread toggle (`CircleCheck`/`Circle`), thumbs up (`ThumbsUp`), thumbs down (`ThumbsDown`)
+   - "Mark above as read" dividers between topic cards: clicking marks all topics above as read (and topics below as unread); read state persisted via `POST /api/readtopics`
+   - Read topics shown below unread section at reduced opacity
    - Login/register flow
    - Thumbs up/down voting on articles
    - SSE subscription for live front page updates (auto-refreshes on new generation)
+   - Topic detail view: click "N sources" on a card to expand inline article list with titles (linked to original), source names, and relative timestamps; lazy-loaded via `GET /api/topics/:topicId/articles`
+   - Per-article ungroup button (`Unlink2` icon) in expanded source list: removes article from topic and re-classifies it via `POST /api/topics/:topicId/articles/:articleId/ungroup`
 
 ### Implementation Status Tracking
 
@@ -85,7 +111,7 @@ All configuration lives in `config.json` at the project root (override path via 
 - **LLM**: Ollama via OpenAI-compatible API (only external process)
 - **Database**: SQLite via `node:sqlite` (embedded, zero deps)
 - **HTTP**: Fastify, serves built SvelteKit UI as static files
-- **Frontend**: SvelteKit (adapter-node) + Tailwind CSS v4
+- **Frontend**: SvelteKit (adapter-static, SPA mode) + Tailwind CSS v4 + Lucide icons (`lucide-svelte`)
 - **Auth**: bcrypt + JWT
 - **RSS**: `rss-parser` npm package
 - **Event/queue**: in-process only (EventEmitter, in-memory async queue)
@@ -101,6 +127,12 @@ cd ui && npm run dev # run SvelteKit UI dev server (proxies /api to :3000)
 # Production build
 npm run build        # build UI then compile backend TS
 npm start            # run compiled output
+
+# Production ops (survive SSH disconnect)
+./start.sh           # nohup launch, pid in newsagg.pid, log in newsagg.log
+./stop.sh            # stop via pidfile
+./rebuild.sh         # build UI + compile backend
+./restart.sh         # stop → rebuild → start
 
 # Type check
 npx tsc --noEmit
@@ -119,7 +151,7 @@ Items tracked in code with `// PLANNED` markers:
 
 - **Embedding-based pre-filter** (`src/consolidator/index.ts:18`) — fast vector similarity step to narrow candidate topics before the LLM matching call
 - ~~**Aggregator punt logic**~~ → **IMPLEMENTED** (`src/aggregator/index.ts`) — tick is skipped entirely when all workers are saturated; per-user queue depth cap (`workers * 2`) prevents queue bloat within a tick
-- **User preferences expansion** — only `interval_ms` is exposed via `GET/PATCH /api/preferences` and `/settings` UI; additional preferences TBD
+- ~~**User preferences expansion**~~ → **IMPLEMENTED** — `interval_ms` + `preference_profile` (LLM-generated markdown) exposed via `GET/PATCH /api/preferences` and `/settings` UI; profile auto-generated from votes via profiler, hand-editable in settings
 - ~~**WebSocket push**~~ → **IMPLEMENTED as SSE push** (`src/server/index.ts`) — `GET /api/events?token=<jwt>` sends `frontpage` events when a new front page is generated; UI auto-refreshes via `EventSource` with exponential backoff reconnect
 - **`thinking_effort` parameter** (`src/ai/index.ts:29`) — commented out pending model support in Ollama
 
@@ -141,6 +173,24 @@ A log of non-obvious choices and course corrections. Read these before proposing
 
 7. **Grabber → consolidator is decoupled via async queue** (2026-04-07): The grabber calls `consolidator.enqueue()` synchronously (just pushes to a buffer). The consolidator has its own drain loop that processes articles in batches every 5 seconds. This prevents a slow Ollama response from blocking RSS polling.
 
-8. **Batched paginated topic matching** (2026-04-07): The consolidator matches up to 10 articles at a time against topics in pages of 50, ordered by `created_at DESC` (newest first). The LLM reports which articles matched and which didn't; unmatched articles are retried against the next page of 50 topics. Articles still unmatched after all pages get new topics. This keeps prompt size bounded regardless of how many topics accumulate.
+8. **Batched paginated topic matching** (2026-04-07, updated 2026-04-14): The consolidator matches up to 10 articles at a time against topics in pages of 50, ordered by `created_at DESC` (newest first). All articles are checked against every topic page (not pruned after a match), accumulating topic matches across pages — this is necessary because a multi-subject article may match topics on different pages. Articles with no matches after all pages get new topics. This keeps prompt size bounded regardless of how many topics accumulate.
 
 9. **Per-user front page intervals** (2026-04-07): Each user has their own `interval_ms` in the DB. The aggregator ticks every 30 seconds and checks each user's last generation time against their interval. This replaces the earlier single global interval, honoring the schema that was already there.
+
+10. **adapter-static over adapter-node** (2026-04-10): Switched SvelteKit from `adapter-node` to `adapter-static` with SPA fallback (`fallback: 'index.html'`). The UI is a pure SPA with no server-side load functions — all data comes via API calls. adapter-node produces a Node.js SSR server which can't be served by `@fastify/static`; adapter-static produces plain HTML/JS/CSS files that Fastify serves directly. Root `+layout.ts` exports `prerender = false` and `ssr = false`.
+
+11. **LLM response code fence stripping** (2026-04-10): Both consolidator and aggregator strip markdown code fences (` ```json ... ``` `) from LLM responses before JSON parsing via `stripCodeFences()`. Models (especially Gemma 4) wrap JSON in code fences despite explicit "no code fences" prompts. Without stripping, all `JSON.parse()` calls fail.
+
+12. **max_tokens = 4096 for LLM output** (2026-04-10): The AI client sends `max_tokens: 4096` (output token limit), not `maxContextTokens` (which controls prompt sizing). Gemma 4 uses reasoning/thinking tokens that consume the `max_tokens` budget before generating visible content — 1024 was too low, causing empty responses.
+
+13. **Preference profile over raw vote scoring** (2026-04-13): Replaced direct vote-based topic scoring with an LLM-generated preference profile. Previously, the aggregator read all raw votes, aggregated them to per-topic numeric scores, and used those to rank sections. Now: votes trigger a debounced (15-min) LLM call that generates a markdown preference description, stored in the users table. The aggregator injects this profile into its headline-generation prompt and asks the LLM to also return a relevance score (1–5) per section. Users can hand-edit the profile in settings. Raw votes are retained in `user_votes` as source data for profile regeneration. Rationale: numeric vote aggregation has no semantic understanding — a profile description lets the LLM reason about *why* a user liked/disliked content.
+
+14. ~~**View-gated signal consumption**~~ → **REPLACED by read-topic tracking** (2026-04-13): The signal `consumed` flag and `last_viewed_at` are no longer used. Instead, the aggregator reads a 14-day rolling window of all signals regardless of consumption state. Users mark topics as read via a "read line" UI divider (`POST /api/readtopics`), and read topics are excluded from future front page generation. `user_read_topics(user_id, topic_id, read_at)` table tracks read state. Old signals are cleaned up hourly. Rationale: the view-gated model only showed signals since last visit; the rolling window + read tracking gives users up to 100 topics from the last 2 weeks and lets them progressively work through them.
+
+15. **Persistent topic summaries over per-generation LLM headlines** (2026-04-13): Instead of generating headlines and summaries via LLM at front-page time (which was feasible for 8 sections but not for 100), topic summaries are generated once by the consolidator and stored in `topics.summary`. Summaries are created when a topic reaches 2+ articles and regenerated when `substantial_new_info` is detected. Single-article topics use the article's own text as summary. The aggregator uses `topic.title` as the headline. Rationale: decouples summary quality from front-page generation speed; avoids 10+ sequential LLM calls per front page.
+
+16. **Read line as atomic state replacement** (2026-04-13): `POST /api/readtopics` receives the full set of topic IDs that should be read. The server does a transactional delete-all + re-insert for the user. This means clicking a "mark above as read" divider in the middle of the list also un-reads anything below it that was previously read. Rationale: simpler than incremental add/remove operations, and the read-line metaphor naturally implies a single position in the list.
+
+17. **Card design: floating, borderless, rounded** (2026-04-14): Topic cards use shadow-based separation (no borders), large border radius (`rounded-xl`), and a subtle hover lift effect (`hover:shadow-lg hover:-translate-y-0.5`). Page background is warm stone (`stone-50`/`stone-950`) so white cards appear to float. Rationale: modern "material" aesthetic — cards as floating paper rather than bordered boxes. Keep this direction when adding new card-like UI elements.
+
+18. **Many-to-many article-topic relationship** (2026-04-14): Articles are linked to topics via an `article_topics` junction table, not a single `topic_id` FK. A roundup article covering US-Iran diplomacy and Artemis II should belong to both topics, not merge them. The legacy `articles.topic_id` column remains (SQLite can't drop columns) but is vestigial — all queries use the junction table. The consolidator's LLM prompt returns `topicIds: number[]` per article. Topic summaries are instructed to focus only on aspects relevant to the specific topic, since shared articles may cover unrelated subjects.

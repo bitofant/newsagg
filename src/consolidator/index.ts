@@ -17,6 +17,8 @@ function stripCodeFences(text: string): string {
 export interface Consolidator {
   /** Push an article into the internal queue (sync, non-blocking) */
   enqueue(article: RawArticle): void
+  /** Remove an article from a topic and re-classify it against other topics */
+  ungroupArticle(articleId: number, topicId: number): Promise<{ newTopicIds: number[] }>
   start(): void
   stop(): void
 }
@@ -52,58 +54,72 @@ export function createConsolidator({ db, ai }: { db: Db; ai: AiClient }): Consol
   }
 
   async function processBatch(articles: RawArticle[]): Promise<void> {
-    let unmatched = articles
     const totalTopics = db.news.topicCount()
     let offset = 0
+    // Accumulate matched topics per article across all pages
+    const matchesByIndex = new Map<number, Topic[]>()
 
-    // Page through topics, matching unmatched articles against each page
-    while (unmatched.length > 0 && offset < totalTopics) {
+    while (offset < totalTopics) {
       const topicPage = db.news.listTopicsPaginated(TOPIC_PAGE_SIZE, offset)
       if (topicPage.length === 0) break
 
-      const { matched, remaining } = await matchBatchAgainstTopics(ai, unmatched, topicPage)
-
-      // Process matched articles
-      for (const { article, topic } of matched) {
-        await saveMatchedArticle(article, topic)
+      const results = await matchBatchAgainstTopics(ai, articles, topicPage)
+      for (const { articleIndex, topics } of results) {
+        const existing = matchesByIndex.get(articleIndex) ?? []
+        existing.push(...topics)
+        matchesByIndex.set(articleIndex, existing)
       }
 
-      unmatched = remaining
       offset += TOPIC_PAGE_SIZE
     }
 
-    // Anything still unmatched gets a new topic
-    for (const article of unmatched) {
-      await saveNewTopic(article)
+    // Save matched articles, create new topics for unmatched
+    for (let i = 0; i < articles.length; i++) {
+      const topics = matchesByIndex.get(i)
+      if (topics && topics.length > 0) {
+        await saveMatchedArticle(articles[i], topics)
+      } else {
+        await saveNewTopic(articles[i])
+      }
     }
   }
 
-  async function saveMatchedArticle(article: RawArticle, topic: Topic): Promise<void> {
-    db.news.updateTopicTimestamp(topic.id)
+  async function saveMatchedArticle(article: RawArticle, topics: Topic[]): Promise<void> {
     const saved = db.news.addArticle({
-      topicId: topic.id,
+      topicIds: topics.map((t) => t.id),
       source: article.source,
       url: article.url,
       title: article.title,
       text: article.text,
     })
 
-    const recentArticleTitles = db.news
-      .listRecentArticlesByTopic(topic.id, 6)
-      .filter((a) => a.id !== saved.id)
-      .slice(0, 5)
-      .map((a) => a.title)
+    for (const topic of topics) {
+      db.news.updateTopicTimestamp(topic.id)
 
-    const assessment = await assessArticle(ai, article, topic, recentArticleTitles)
+      const recentArticleTitles = db.news
+        .listRecentArticlesByTopic(topic.id, 6)
+        .filter((a) => a.id !== saved.id)
+        .slice(0, 5)
+        .map((a) => a.title)
 
-    if (assessment.isSubstantial) {
-      db.users.enqueueSignalForAllUsers({ type: 'substantial_new_info', topicId: topic.id, articleId: saved.id })
-    } else {
-      db.users.enqueueSignalForAllUsers({ type: 'added_to_topic', topicId: topic.id, articleId: saved.id })
-    }
+      const assessment = await assessArticle(ai, article, topic, recentArticleTitles)
 
-    if (assessment.isConcluded) {
-      db.users.enqueueSignalForAllUsers({ type: 'concluded_issue', topicId: topic.id, articleId: saved.id })
+      if (assessment.isSubstantial) {
+        db.users.enqueueSignalForAllUsers({ type: 'substantial_new_info', topicId: topic.id, articleId: saved.id })
+        db.users.unreadTopicForNonDownvoters(topic.id)
+      } else {
+        db.users.enqueueSignalForAllUsers({ type: 'added_to_topic', topicId: topic.id, articleId: saved.id })
+      }
+
+      if (assessment.isConcluded) {
+        db.users.enqueueSignalForAllUsers({ type: 'concluded_issue', topicId: topic.id, articleId: saved.id })
+      }
+
+      // Generate or regenerate topic summary
+      const articleCount = db.news.getArticleCountByTopic(topic.id)
+      if (assessment.isSubstantial || (articleCount >= 2 && !topic.summary)) {
+        await regenerateTopicSummary(ai, db, topic.id)
+      }
     }
   }
 
@@ -111,7 +127,7 @@ export function createConsolidator({ db, ai }: { db: Db; ai: AiClient }): Consol
     const { title, description } = await generateTopicSummary(ai, article)
     const topic = db.news.createTopic(title, description)
     const saved = db.news.addArticle({
-      topicId: topic.id,
+      topicIds: [topic.id],
       source: article.source,
       url: article.url,
       title: article.title,
@@ -120,8 +136,70 @@ export function createConsolidator({ db, ai }: { db: Db; ai: AiClient }): Consol
     db.users.enqueueSignalForAllUsers({ type: 'new_topic', topicId: topic.id, articleId: saved.id })
   }
 
+  async function ungroupArticle(articleId: number, topicId: number): Promise<{ newTopicIds: number[] }> {
+    const article = db.news.getArticleById(articleId)
+    if (!article) throw new Error(`Article ${articleId} not found`)
+
+    db.news.unlinkArticleFromTopic(articleId, topicId)
+
+    // Re-classify: run paginated matching excluding the old topic
+    const asRaw: RawArticle = { title: article.title, text: article.text, source: article.source, url: article.url }
+    const totalTopics = db.news.topicCount()
+    let offset = 0
+    const matchedTopics: Topic[] = []
+
+    while (offset < totalTopics) {
+      const topicPage = db.news.listTopicsPaginated(TOPIC_PAGE_SIZE, offset).filter((t) => t.id !== topicId)
+      if (topicPage.length > 0) {
+        const results = await matchBatchAgainstTopics(ai, [asRaw], topicPage)
+        for (const { topics } of results) {
+          matchedTopics.push(...topics)
+        }
+      }
+      offset += TOPIC_PAGE_SIZE
+    }
+
+    const newTopicIds: number[] = []
+
+    if (matchedTopics.length > 0) {
+      for (const topic of matchedTopics) {
+        db.news.linkArticleToTopic(articleId, topic.id)
+        db.news.updateTopicTimestamp(topic.id)
+        db.users.enqueueSignalForAllUsers({ type: 'added_to_topic', topicId: topic.id, articleId })
+        const count = db.news.getArticleCountByTopic(topic.id)
+        if (count >= 2 && !topic.summary) {
+          await regenerateTopicSummary(ai, db, topic.id)
+        }
+        newTopicIds.push(topic.id)
+      }
+    } else {
+      // No match — create standalone topic
+      const { title, description } = await generateTopicSummary(ai, asRaw)
+      const newTopic = db.news.createTopic(title, description)
+      db.news.linkArticleToTopic(articleId, newTopic.id)
+      db.users.enqueueSignalForAllUsers({ type: 'new_topic', topicId: newTopic.id, articleId })
+      newTopicIds.push(newTopic.id)
+    }
+
+    // Update legacy topic_id to first new topic
+    if (newTopicIds.length > 0) {
+      db.news.linkArticleToTopic(articleId, newTopicIds[0])
+    }
+
+    // Clean up old topic
+    const oldCount = db.news.getArticleCountByTopic(topicId)
+    if (oldCount === 0) {
+      db.news.deleteTopic(topicId)
+    } else if (oldCount >= 2) {
+      await regenerateTopicSummary(ai, db, topicId)
+    }
+
+    return { newTopicIds }
+  }
+
   return {
     enqueue,
+    ungroupArticle,
     start() {
       timer = setInterval(drain, DRAIN_INTERVAL_MS)
     },
@@ -131,16 +209,16 @@ export function createConsolidator({ db, ai }: { db: Db; ai: AiClient }): Consol
   }
 }
 
-interface BatchMatchResult {
-  matched: { article: RawArticle; topic: Topic }[]
-  remaining: RawArticle[]
+interface BatchMatchEntry {
+  articleIndex: number
+  topics: Topic[]
 }
 
 async function matchBatchAgainstTopics(
   ai: AiClient,
   articles: RawArticle[],
   topics: Topic[],
-): Promise<BatchMatchResult> {
+): Promise<BatchMatchEntry[]> {
   const topicList = topics.map((t) => `${t.id}: ${t.title} — ${t.description}`).join('\n')
 
   const articleList = articles
@@ -156,34 +234,32 @@ ${topicList}
 New articles:
 ${articleList}
 
-For each article, decide if it belongs to one of the existing topics.
-Reply with a JSON array. Each entry has "article" (the article index number) and "topicId" (the matching topic ID number, or "none" if no match).
+For each article, decide which existing topics it belongs to. An article may match multiple topics if it covers multiple subjects. Only match if the article contains substantial information about that topic — a passing mention is not enough.
+Reply with a JSON array. Each entry has "article" (the article index number) and "topicIds" (an array of matching topic ID numbers, or an empty array if no match).
 
-Example: [{"article": 0, "topicId": 5}, {"article": 1, "topicId": "none"}]
+Example: [{"article": 0, "topicIds": [5, 12]}, {"article": 1, "topicIds": []}]
 
 Reply with ONLY the JSON array, no other text.`,
   )
 
-  const matched: { article: RawArticle; topic: Topic }[] = []
-  const matchedIndices = new Set<number>()
+  const entries: BatchMatchEntry[] = []
 
   try {
-    const results = JSON.parse(stripCodeFences(response)) as { article: number; topicId: number | 'none' }[]
+    const results = JSON.parse(stripCodeFences(response)) as { article: number; topicIds: number[] }[]
     for (const result of results) {
-      if (result.topicId === 'none') continue
-      const article = articles[result.article]
-      const topic = topics.find((t) => t.id === result.topicId)
-      if (article && topic) {
-        matched.push({ article, topic })
-        matchedIndices.add(result.article)
+      if (!result.topicIds || result.topicIds.length === 0) continue
+      const matchedTopics = result.topicIds
+        .map((id) => topics.find((t) => t.id === id))
+        .filter((t): t is Topic => !!t)
+      if (matchedTopics.length > 0) {
+        entries.push({ articleIndex: result.article, topics: matchedTopics })
       }
     }
   } catch {
     console.error('[consolidator] failed to parse batch match response, treating all as unmatched:', response)
   }
 
-  const remaining = articles.filter((_, i) => !matchedIndices.has(i))
-  return { matched, remaining }
+  return entries
 }
 
 async function generateTopicSummary(ai: AiClient, article: RawArticle): Promise<{ title: string; description: string }> {
@@ -202,6 +278,35 @@ Reply with JSON only: { "title": "short topic title", "description": "one senten
     return { title: json.title, description: json.description }
   } catch {
     return { title: article.title.slice(0, 80), description: article.text.slice(0, 120) }
+  }
+}
+
+async function regenerateTopicSummary(ai: AiClient, db: Db, topicId: number): Promise<void> {
+  const articles = db.news.listRecentArticlesByTopic(topicId, 10)
+  if (articles.length < 2) return
+
+  const articleContext = articles
+    .map((a) => `- "${a.title}" (${a.source}): ${a.text.slice(0, 200)}`)
+    .join('\n')
+
+  const topic = db.news.listTopics().find((t) => t.id === topicId)
+  if (!topic) return
+
+  try {
+    const response = await ai.complete(
+      `You are a news editor. Write a concise 2-3 sentence summary of this news topic based on the latest articles.\n` +
+        `Some articles may cover multiple topics — focus ONLY on aspects relevant to this specific topic.\n\n` +
+        `Topic: ${topic.title}\n` +
+        `Background: ${topic.description}\n\n` +
+        `Recent articles:\n${articleContext}\n\n` +
+        `Reply with ONLY the summary text, no JSON, no formatting.`,
+    )
+    const summary = response.trim()
+    if (summary) {
+      db.news.updateTopicSummary(topicId, summary)
+    }
+  } catch {
+    console.error(`[consolidator] failed to generate summary for topic ${topicId}`)
   }
 }
 

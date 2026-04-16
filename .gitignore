@@ -6,3 +6,8 @@ ui/node_modules/
 *.db
 *.db-wal
 *.db-shm
+newsagg.pid
+newsagg.log
+.jwt_secret
+llm/
+config.json

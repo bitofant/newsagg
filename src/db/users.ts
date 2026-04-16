@@ -6,6 +6,9 @@ export interface User {
   passwordHash: string
   createdAt: number
   intervalMs: number
+  preferenceProfile: string | null
+  preferenceGeneratedAt: number | null
+  lastViewedAt: number | null
 }
 
 export type Signal =
@@ -20,13 +23,43 @@ export interface UserDb {
   listAllUsers(): User[]
   getUserById(userId: number): User | undefined
   updateUserInterval(userId: number, intervalMs: number): void
-  recordVote(userId: number, articleId: number, vote: 1 | -1): void
+  updatePreferenceProfile(userId: number, profile: string): void
+  recordVote(userId: number, articleId: number, vote: 1 | -1 | 0): void
   getVotesByUser(userId: number): { articleId: number; topicId: number; vote: number }[]
+  getVotesWithContext(userId: number): { articleTitle: string; topicTitle: string; topicDescription: string; vote: number }[]
   enqueueSignalForAllUsers(signal: Signal): void
-  consumePendingSignals(userId: number): Signal[]
+  readSignalsInWindow(userId: number, windowMs: number): Signal[]
+  getReadTopicIds(userId: number): Set<number>
+  setReadTopics(userId: number, topicIds: number[]): void
+  unreadTopicForNonDownvoters(topicId: number): void
+  cleanupOldSignals(maxAgeMs: number): void
   saveFrontPage(userId: number, data: string): void
   getLatestFrontPage(userId: number): { generatedAt: number; data: string } | undefined
   getLastFrontPageTime(userId: number): number | undefined
+}
+
+type UserRow = {
+  id: number
+  email: string
+  password_hash: string
+  created_at: number
+  interval_ms: number
+  preference_profile: string | null
+  preference_generated_at: number | null
+  last_viewed_at: number | null
+}
+
+function mapUserRow(r: UserRow): User {
+  return {
+    id: r.id,
+    email: r.email,
+    passwordHash: r.password_hash,
+    createdAt: r.created_at,
+    intervalMs: r.interval_ms,
+    preferenceProfile: r.preference_profile,
+    preferenceGeneratedAt: r.preference_generated_at,
+    lastViewedAt: r.last_viewed_at,
+  }
 }
 
 // IMPLEMENTED
@@ -37,60 +70,74 @@ export function createUserDb(db: DatabaseSync): UserDb {
       const result = db
         .prepare('INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)')
         .run(email, passwordHash, now)
-      return { id: Number(result.lastInsertRowid), email, passwordHash, createdAt: now, intervalMs: 15 * 60 * 1000 }
+      return { id: Number(result.lastInsertRowid), email, passwordHash, createdAt: now, intervalMs: 15 * 60 * 1000, preferenceProfile: null, preferenceGeneratedAt: null, lastViewedAt: null }
     },
 
     findUserByEmail(email) {
       const row = db
-        .prepare('SELECT id, email, password_hash, created_at, interval_ms FROM users WHERE email = ?')
-        .get(email) as { id: number; email: string; password_hash: string; created_at: number; interval_ms: number } | undefined
+        .prepare('SELECT id, email, password_hash, created_at, interval_ms, preference_profile, preference_generated_at, last_viewed_at FROM users WHERE email = ?')
+        .get(email) as UserRow | undefined
       if (!row) return undefined
-      return { id: row.id, email: row.email, passwordHash: row.password_hash, createdAt: row.created_at, intervalMs: row.interval_ms }
+      return mapUserRow(row)
     },
 
     listAllUsers() {
       return (
-        db.prepare('SELECT id, email, password_hash, created_at, interval_ms FROM users').all() as {
-          id: number
-          email: string
-          password_hash: string
-          created_at: number
-          interval_ms: number
-        }[]
-      ).map((r) => ({
-        id: r.id,
-        email: r.email,
-        passwordHash: r.password_hash,
-        createdAt: r.created_at,
-        intervalMs: r.interval_ms,
-      }))
+        db.prepare('SELECT id, email, password_hash, created_at, interval_ms, preference_profile, preference_generated_at, last_viewed_at FROM users').all() as UserRow[]
+      ).map(mapUserRow)
     },
 
     getUserById(userId) {
       const row = db
-        .prepare('SELECT id, email, password_hash, created_at, interval_ms FROM users WHERE id = ?')
-        .get(userId) as { id: number; email: string; password_hash: string; created_at: number; interval_ms: number } | undefined
+        .prepare('SELECT id, email, password_hash, created_at, interval_ms, preference_profile, preference_generated_at, last_viewed_at FROM users WHERE id = ?')
+        .get(userId) as UserRow | undefined
       if (!row) return undefined
-      return { id: row.id, email: row.email, passwordHash: row.password_hash, createdAt: row.created_at, intervalMs: row.interval_ms }
+      return mapUserRow(row)
     },
 
     updateUserInterval(userId, intervalMs) {
       db.prepare('UPDATE users SET interval_ms = ? WHERE id = ?').run(intervalMs, userId)
     },
 
+    updatePreferenceProfile(userId, profile) {
+      db.prepare('UPDATE users SET preference_profile = ?, preference_generated_at = ? WHERE id = ?').run(profile, Date.now(), userId)
+    },
+
     recordVote(userId, articleId, vote) {
-      db.prepare(
-        'INSERT INTO user_votes (user_id, article_id, vote) VALUES (?, ?, ?) ON CONFLICT(user_id, article_id) DO UPDATE SET vote = excluded.vote',
-      ).run(userId, articleId, vote)
+      if (vote === 0) {
+        db.prepare('DELETE FROM user_votes WHERE user_id = ? AND article_id = ?').run(userId, articleId)
+      } else {
+        db.prepare(
+          'INSERT INTO user_votes (user_id, article_id, vote) VALUES (?, ?, ?) ON CONFLICT(user_id, article_id) DO UPDATE SET vote = excluded.vote',
+        ).run(userId, articleId, vote)
+      }
     },
 
     getVotesByUser(userId) {
       const rows = db
         .prepare(
-          'SELECT uv.article_id, a.topic_id, uv.vote FROM user_votes uv JOIN articles a ON a.id = uv.article_id WHERE uv.user_id = ?',
+          `SELECT uv.article_id, at.topic_id, uv.vote
+           FROM user_votes uv
+           JOIN article_topics at ON uv.article_id = at.article_id
+           WHERE uv.user_id = ?`,
         )
         .all(userId) as { article_id: number; topic_id: number; vote: number }[]
       return rows.map((r) => ({ articleId: r.article_id, topicId: r.topic_id, vote: r.vote }))
+    },
+
+    getVotesWithContext(userId) {
+      const rows = db
+        .prepare(
+          `SELECT a.title AS article_title, t.title AS topic_title, t.description AS topic_description, uv.vote
+           FROM user_votes uv
+           JOIN articles a ON a.id = uv.article_id
+           JOIN article_topics at ON a.id = at.article_id
+           JOIN topics t ON t.id = at.topic_id
+           WHERE uv.user_id = ?
+           ORDER BY uv.rowid DESC`,
+        )
+        .all(userId) as { article_title: string; topic_title: string; topic_description: string; vote: number }[]
+      return rows.map((r) => ({ articleTitle: r.article_title, topicTitle: r.topic_title, topicDescription: r.topic_description, vote: r.vote }))
     },
 
     enqueueSignalForAllUsers(signal) {
@@ -111,19 +158,57 @@ export function createUserDb(db: DatabaseSync): UserDb {
       }
     },
 
-    consumePendingSignals(userId) {
+    readSignalsInWindow(userId, windowMs) {
+      const since = Date.now() - windowMs
       const rows = db
         .prepare(
-          'SELECT id, type, topic_id, article_id FROM signal_queue WHERE user_id = ? AND consumed = 0 ORDER BY created_at ASC',
+          'SELECT type, topic_id, article_id FROM signal_queue WHERE user_id = ? AND created_at >= ? ORDER BY created_at ASC',
         )
-        .all(userId) as { id: number; type: string; topic_id: number; article_id: number }[]
-
-      if (rows.length === 0) return []
-
-      const ids = rows.map((r) => r.id)
-      db.prepare(`UPDATE signal_queue SET consumed = 1 WHERE id IN (${ids.map(() => '?').join(',')})`).run(...ids)
-
+        .all(userId, since) as { type: string; topic_id: number; article_id: number }[]
       return rows.map((r) => ({ type: r.type, topicId: r.topic_id, articleId: r.article_id }) as Signal)
+    },
+
+    getReadTopicIds(userId) {
+      const rows = db
+        .prepare('SELECT topic_id FROM user_read_topics WHERE user_id = ?')
+        .all(userId) as { topic_id: number }[]
+      return new Set(rows.map((r) => r.topic_id))
+    },
+
+    setReadTopics(userId, topicIds) {
+      db.exec('BEGIN')
+      try {
+        db.prepare('DELETE FROM user_read_topics WHERE user_id = ?').run(userId)
+        if (topicIds.length > 0) {
+          const now = Date.now()
+          const insert = db.prepare('INSERT INTO user_read_topics (user_id, topic_id, read_at) VALUES (?, ?, ?)')
+          for (const topicId of topicIds) {
+            insert.run(userId, topicId, now)
+          }
+        }
+        db.exec('COMMIT')
+      } catch (e) {
+        db.exec('ROLLBACK')
+        throw e
+      }
+    },
+
+    unreadTopicForNonDownvoters(topicId) {
+      db.prepare(
+        `DELETE FROM user_read_topics
+         WHERE topic_id = ?
+           AND user_id NOT IN (
+             SELECT DISTINCT uv.user_id
+             FROM user_votes uv
+             JOIN article_topics at ON uv.article_id = at.article_id
+             WHERE at.topic_id = ? AND uv.vote = -1
+           )`,
+      ).run(topicId, topicId)
+    },
+
+    cleanupOldSignals(maxAgeMs) {
+      const cutoff = Date.now() - maxAgeMs
+      db.prepare('DELETE FROM signal_queue WHERE created_at < ?').run(cutoff)
     },
 
     saveFrontPage(userId, data) {

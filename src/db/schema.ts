@@ -55,11 +55,59 @@ export function applySchema(db: DatabaseSync): void {
       data         TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS article_topics (
+      article_id INTEGER NOT NULL REFERENCES articles(id),
+      topic_id   INTEGER NOT NULL REFERENCES topics(id),
+      PRIMARY KEY (article_id, topic_id)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_articles_topic  ON articles(topic_id);
     CREATE INDEX IF NOT EXISTS idx_articles_url    ON articles(url);
+    CREATE INDEX IF NOT EXISTS idx_article_topics_topic   ON article_topics(topic_id);
+    CREATE INDEX IF NOT EXISTS idx_article_topics_article ON article_topics(article_id);
     CREATE INDEX IF NOT EXISTS idx_signal_queue_user
       ON signal_queue(user_id, consumed, created_at);
     CREATE INDEX IF NOT EXISTS idx_front_pages_user
       ON front_pages(user_id, generated_at DESC);
+  `)
+
+  // Migrations for existing databases
+  const userCols = db.prepare("PRAGMA table_info(users)").all() as { name: string }[]
+  const userColNames = new Set(userCols.map((c) => c.name))
+  if (!userColNames.has('preference_profile')) {
+    db.exec('ALTER TABLE users ADD COLUMN preference_profile TEXT')
+  }
+  if (!userColNames.has('preference_generated_at')) {
+    db.exec('ALTER TABLE users ADD COLUMN preference_generated_at INTEGER')
+  }
+  if (!userColNames.has('last_viewed_at')) {
+    db.exec('ALTER TABLE users ADD COLUMN last_viewed_at INTEGER')
+  }
+
+  // Topics summary column
+  const topicCols = db.prepare("PRAGMA table_info(topics)").all() as { name: string }[]
+  const topicColNames = new Set(topicCols.map((c) => c.name))
+  if (!topicColNames.has('summary')) {
+    db.exec('ALTER TABLE topics ADD COLUMN summary TEXT')
+  }
+
+  // Backfill article_topics from legacy articles.topic_id column
+  const atCount = (db.prepare('SELECT COUNT(*) as count FROM article_topics').get() as { count: number }).count
+  if (atCount === 0) {
+    const articleCount = (db.prepare('SELECT COUNT(*) as count FROM articles').get() as { count: number }).count
+    if (articleCount > 0) {
+      db.exec('INSERT OR IGNORE INTO article_topics (article_id, topic_id) SELECT id, topic_id FROM articles')
+    }
+  }
+
+  // Read-topic tracking table
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS user_read_topics (
+      user_id  INTEGER NOT NULL REFERENCES users(id),
+      topic_id INTEGER NOT NULL REFERENCES topics(id),
+      read_at  INTEGER NOT NULL,
+      PRIMARY KEY (user_id, topic_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_read_topics_user ON user_read_topics(user_id);
   `)
 }

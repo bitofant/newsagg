@@ -5,7 +5,7 @@
   ],
   "ai": {
     "url": "http://localhost:11434/v1",
-    "model": "gemma4:31b-it-q4_K_M",
+    "model": "gemma3:27b",
     "thinkingEffort": "medium",
     "maxContextTokens": 40960
   },
@@ -14,8 +14,9 @@
     "workers": 2
   },
   "server": {
-    "port": 3001,
-    "uiDir": "./ui/build"
+    "port": 3000,
+    "uiDir": "./ui/build",
+    "registrationEnabled": true
   },
   "dbPath": "./newsagg.db"
 }

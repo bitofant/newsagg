@@ -3,21 +3,42 @@ import fastifyStatic from '@fastify/static'
 import path from 'path'
 import bcrypt from 'bcrypt'
 import jwt from 'jsonwebtoken'
+import { randomBytes } from 'node:crypto'
+import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import type { ServerResponse } from 'http'
 import type { Db } from '../db/index.js'
 import type { Aggregator } from '../aggregator/index.js'
+import type { Consolidator } from '../consolidator/index.js'
+import type { Profiler } from '../profiler/index.js'
 import type { ServerConfig } from '../config.js'
 
-const JWT_SECRET = process.env['JWT_SECRET'] ?? 'dev-secret-change-in-production'
+const JWT_SECRET = loadJwtSecret()
+
+function loadJwtSecret(): string {
+  if (process.env['JWT_SECRET']) return process.env['JWT_SECRET']
+
+  const secretFile = '.jwt_secret'
+  if (existsSync(secretFile)) {
+    const secret = readFileSync(secretFile, 'utf-8').trim()
+    if (secret) return secret
+  }
+
+  const secret = randomBytes(32).toString('hex')
+  writeFileSync(secretFile, secret, { mode: 0o600 })
+  console.log('Generated new JWT secret and saved to .jwt_secret')
+  return secret
+}
 
 export interface ServerOptions {
   db: Db
   aggregator: Aggregator
+  consolidator: Consolidator
+  profiler: Profiler
   config: ServerConfig
 }
 
 // IMPLEMENTED: auth routes, front page API, voting endpoint, user preferences, SSE push for new front pages
-export async function createServer({ db, aggregator, config }: ServerOptions) {
+export async function createServer({ db, aggregator, consolidator, profiler, config }: ServerOptions) {
   const app = Fastify({ logger: true })
 
   // SSE connections: userId -> set of active response streams
@@ -47,7 +68,12 @@ export async function createServer({ db, aggregator, config }: ServerOptions) {
 
   // --- Auth ---
 
+  app.get('/api/registration-enabled', async () => {
+    return { enabled: config.registrationEnabled }
+  })
+
   app.post('/api/register', async (req, reply) => {
+    if (!config.registrationEnabled) return reply.status(403).send({ error: 'registration is disabled' })
     const { email, password } = req.body as { email?: string; password?: string }
     if (!email || !password) return reply.status(400).send({ error: 'email and password required' })
 
@@ -83,7 +109,19 @@ export async function createServer({ db, aggregator, config }: ServerOptions) {
 
     const page = aggregator.getLatestFrontPage(userId)
     if (!page) return reply.status(204).send()
-    return page
+    const readTopicIds = [...db.users.getReadTopicIds(userId)]
+    return { ...page, readTopicIds }
+  })
+
+  app.post('/api/readtopics', async (req, reply) => {
+    const userId = authenticate(req)
+    if (!userId) return reply.status(401).send({ error: 'unauthorized' })
+    const { topicIds } = req.body as { topicIds?: number[] }
+    if (!Array.isArray(topicIds) || !topicIds.every((id) => typeof id === 'number')) {
+      return reply.status(400).send({ error: 'topicIds must be an array of numbers' })
+    }
+    db.users.setReadTopics(userId, topicIds)
+    return { ok: true }
   })
 
   // --- Voting ---
@@ -92,11 +130,12 @@ export async function createServer({ db, aggregator, config }: ServerOptions) {
     if (!userId) return reply.status(401).send({ error: 'unauthorized' })
 
     const { articleId, vote } = req.body as { articleId?: number; vote?: number }
-    if (!articleId || (vote !== 1 && vote !== -1)) {
-      return reply.status(400).send({ error: 'articleId and vote (1 or -1) required' })
+    if (!articleId || (vote !== 1 && vote !== -1 && vote !== 0)) {
+      return reply.status(400).send({ error: 'articleId and vote (1, -1, or 0) required' })
     }
 
-    db.users.recordVote(userId, articleId, vote as 1 | -1)
+    db.users.recordVote(userId, articleId, vote as 1 | -1 | 0)
+    profiler.onVote(userId)
     return { ok: true }
   })
 
@@ -108,20 +147,61 @@ export async function createServer({ db, aggregator, config }: ServerOptions) {
 
     const user = db.users.getUserById(userId)
     if (!user) return reply.status(404).send({ error: 'user not found' })
-    return { intervalMs: user.intervalMs }
+    return { intervalMs: user.intervalMs, preferenceProfile: user.preferenceProfile ?? '' }
   })
 
   app.patch('/api/preferences', async (req, reply) => {
     const userId = authenticate(req)
     if (!userId) return reply.status(401).send({ error: 'unauthorized' })
 
-    const { intervalMs } = req.body as { intervalMs?: number }
-    if (typeof intervalMs !== 'number' || intervalMs < 5 * 60 * 1000 || intervalMs > 24 * 60 * 60 * 1000) {
-      return reply.status(400).send({ error: 'intervalMs must be between 5 minutes and 24 hours' })
+    const { intervalMs, preferenceProfile } = req.body as { intervalMs?: number; preferenceProfile?: string }
+
+    if (intervalMs !== undefined) {
+      if (typeof intervalMs !== 'number' || intervalMs < 5 * 60 * 1000 || intervalMs > 24 * 60 * 60 * 1000) {
+        return reply.status(400).send({ error: 'intervalMs must be between 5 minutes and 24 hours' })
+      }
+      db.users.updateUserInterval(userId, intervalMs)
     }
 
-    db.users.updateUserInterval(userId, intervalMs)
-    return { intervalMs }
+    if (preferenceProfile !== undefined) {
+      if (typeof preferenceProfile !== 'string' || preferenceProfile.length > 10000) {
+        return reply.status(400).send({ error: 'preferenceProfile must be a string under 10000 chars' })
+      }
+      db.users.updatePreferenceProfile(userId, preferenceProfile)
+    }
+
+    const user = db.users.getUserById(userId)
+    return { intervalMs: user!.intervalMs, preferenceProfile: user!.preferenceProfile ?? '' }
+  })
+
+  // --- Topics ---
+
+  app.get('/api/topics/:topicId/articles', async (req, reply) => {
+    const userId = authenticate(req)
+    if (!userId) return reply.status(401).send({ error: 'unauthorized' })
+
+    const topicId = parseInt((req.params as { topicId: string }).topicId, 10)
+    if (isNaN(topicId)) return reply.status(400).send({ error: 'invalid topicId' })
+
+    const articles = db.news.listArticlesByTopic(topicId)
+    return articles.map(({ id, title, source, url, fetchedAt }) => ({ id, title, source, url, fetchedAt }))
+  })
+
+  app.post('/api/topics/:topicId/articles/:articleId/ungroup', async (req, reply) => {
+    const userId = authenticate(req)
+    if (!userId) return reply.status(401).send({ error: 'unauthorized' })
+
+    const topicId = parseInt((req.params as { topicId: string }).topicId, 10)
+    const articleId = parseInt((req.params as { articleId: string }).articleId, 10)
+    if (isNaN(topicId) || isNaN(articleId)) return reply.status(400).send({ error: 'invalid topicId or articleId' })
+
+    try {
+      const result = await consolidator.ungroupArticle(articleId, topicId)
+      return result
+    } catch (err) {
+      req.log.error(err, 'ungroup failed')
+      return reply.status(500).send({ error: 'ungroup failed' })
+    }
   })
 
   // --- SSE: real-time front page push ---

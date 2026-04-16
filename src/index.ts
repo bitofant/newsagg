@@ -3,6 +3,7 @@ import { createAi } from './ai/index.js'
 import { createGrabber } from './grabber/index.js'
 import { createConsolidator } from './consolidator/index.js'
 import { createAggregator } from './aggregator/index.js'
+import { createProfiler } from './profiler/index.js'
 import { createServer } from './server/index.js'
 import { config } from './config.js'
 
@@ -20,13 +21,14 @@ async function main() {
     db,
     ai,
     config: config.aggregator,
-    aiConfig: config.ai,
     onFrontPageGenerated: (userId, generatedAt) => {
       notifyFrontPage?.(userId, generatedAt)
     },
   })
 
-  const server = await createServer({ db, aggregator, config: config.server })
+  const profiler = createProfiler({ db, ai })
+
+  const server = await createServer({ db, aggregator, consolidator, profiler, config: config.server })
   notifyFrontPage = server.notifyFrontPageGenerated.bind(server)
 
   await server.listen()

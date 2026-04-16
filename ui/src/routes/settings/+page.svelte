@@ -13,6 +13,7 @@
   ]
 
   let intervalMs = $state(15 * 60 * 1000)
+  let preferenceProfile = $state('')
   let loading = $state(true)
   let saving = $state(false)
   let message = $state('')
@@ -25,6 +26,7 @@
     try {
       const prefs = await getPreferences()
       intervalMs = prefs.intervalMs
+      preferenceProfile = prefs.preferenceProfile ?? ''
     } catch (e) {
       message = `Failed to load: ${e}`
     } finally {
@@ -36,7 +38,7 @@
     saving = true
     message = ''
     try {
-      await updatePreferences({ intervalMs })
+      await updatePreferences({ intervalMs, preferenceProfile })
       message = 'Saved.'
     } catch (e) {
       message = String(e)
@@ -47,35 +49,49 @@
 </script>
 
 <div class="max-w-md">
-  <a href="/" class="text-sm text-stone-500 hover:text-stone-900">&larr; back</a>
+  <a href="/" class="text-sm text-stone-500 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-100">&larr; back</a>
   <h1 class="font-serif text-2xl font-bold mt-4 mb-6">Settings</h1>
 
   {#if loading}
-    <p class="text-stone-400">Loading...</p>
+    <p class="text-stone-400 dark:text-stone-500">Loading...</p>
   {:else}
-    <label for="interval" class="block text-sm font-medium text-stone-700 mb-2">
+    <label for="interval" class="block text-sm font-medium text-stone-700 dark:text-stone-300 mb-2">
       Generate front page every:
     </label>
     <select
       id="interval"
       bind:value={intervalMs}
-      class="block w-full border border-stone-300 rounded px-3 py-2 text-sm bg-white"
+      class="block w-full border border-stone-300 dark:border-stone-700 rounded px-3 py-2 text-sm bg-white dark:bg-stone-800 dark:text-stone-100"
     >
       {#each INTERVAL_OPTIONS as opt}
         <option value={opt.value}>{opt.label}</option>
       {/each}
     </select>
 
+    <label for="profile" class="block text-sm font-medium text-stone-700 dark:text-stone-300 mb-2 mt-6">
+      Preference profile
+    </label>
+    <p class="text-xs text-stone-500 dark:text-stone-400 mb-2">
+      Auto-generated from your votes. You can edit this to fine-tune your front page.
+    </p>
+    <textarea
+      id="profile"
+      bind:value={preferenceProfile}
+      rows="10"
+      class="block w-full border border-stone-300 dark:border-stone-700 rounded px-3 py-2 text-sm bg-white dark:bg-stone-800 dark:text-stone-100 font-mono"
+      placeholder="Vote on some articles and your preference profile will be generated automatically..."
+    ></textarea>
+
     <button
       onclick={save}
       disabled={saving}
-      class="mt-4 px-4 py-2 bg-stone-800 text-white text-sm rounded hover:bg-stone-700 disabled:opacity-50"
+      class="mt-4 px-4 py-2 bg-stone-800 dark:bg-stone-100 text-white dark:text-stone-900 text-sm rounded hover:bg-stone-700 dark:hover:bg-stone-300 disabled:opacity-50"
     >
       {saving ? 'Saving...' : 'Save'}
     </button>
 
     {#if message}
-      <p class="mt-3 text-sm {message === 'Saved.' ? 'text-green-600' : 'text-red-500'}">{message}</p>
+      <p class="mt-3 text-sm {message === 'Saved.' ? 'text-green-600 dark:text-green-400' : 'text-red-500 dark:text-red-400'}">{message}</p>
     {/if}
   {/if}
 </div>

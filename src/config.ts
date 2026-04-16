@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { readFileSync, existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 export interface Config {
@@ -28,10 +28,17 @@ export interface ServerConfig {
   port: number
   /** Directory where built SvelteKit UI is located */
   uiDir: string
+  /** Whether new user registration is allowed. Set to true to open registration. */
+  registrationEnabled: boolean
 }
 
 function loadConfig(): Config {
   const configPath = resolve(process.env['CONFIG_PATH'] ?? './config.json')
+  if (!existsSync(configPath)) {
+    console.error(`Config file not found: ${configPath}`)
+    console.error(`Create it from the template: cp config.example.json config.json`)
+    process.exit(1)
+  }
   const raw = JSON.parse(readFileSync(configPath, 'utf-8'))
 
   return {
@@ -51,6 +58,7 @@ function loadConfig(): Config {
     server: {
       port: raw.server?.port ?? 3000,
       uiDir: raw.server?.uiDir ?? './ui/build',
+      registrationEnabled: raw.server?.registrationEnabled ?? false,
     },
   }
 }

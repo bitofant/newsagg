@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte'
   import { goto } from '$app/navigation'
   import { login, register } from '$lib/api'
 
@@ -7,6 +8,15 @@
   let mode: 'login' | 'register' = 'login'
   let error = ''
   let loading = false
+  let registrationEnabled = false
+
+  onMount(async () => {
+    const res = await fetch('/api/registration-enabled')
+    if (res.ok) {
+      const data = await res.json()
+      registrationEnabled = data.enabled
+    }
+  })
 
   async function submit() {
     error = ''
@@ -39,7 +49,7 @@
         type="email"
         bind:value={email}
         required
-        class="w-full border border-stone-300 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-stone-400"
+        class="w-full border border-stone-300 dark:border-stone-700 rounded px-3 py-2 text-sm bg-white dark:bg-stone-800 dark:text-stone-100 focus:outline-none focus:ring-2 focus:ring-stone-400 dark:focus:ring-stone-500"
       />
     </div>
     <div>
@@ -49,28 +59,30 @@
         type="password"
         bind:value={password}
         required
-        class="w-full border border-stone-300 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-stone-400"
+        class="w-full border border-stone-300 dark:border-stone-700 rounded px-3 py-2 text-sm bg-white dark:bg-stone-800 dark:text-stone-100 focus:outline-none focus:ring-2 focus:ring-stone-400 dark:focus:ring-stone-500"
       />
     </div>
 
     {#if error}
-      <p class="text-red-500 text-sm">{error}</p>
+      <p class="text-red-500 dark:text-red-400 text-sm">{error}</p>
     {/if}
 
     <button
       type="submit"
       disabled={loading}
-      class="w-full bg-stone-900 text-white rounded py-2 text-sm font-medium hover:bg-stone-700 disabled:opacity-50"
+      class="w-full bg-stone-900 dark:bg-stone-100 text-white dark:text-stone-900 rounded py-2 text-sm font-medium hover:bg-stone-700 dark:hover:bg-stone-300 disabled:opacity-50"
     >
       {loading ? 'Please wait…' : mode === 'login' ? 'Sign in' : 'Create account'}
     </button>
   </form>
 
-  <p class="text-center text-sm text-stone-500 mt-4">
+  {#if registrationEnabled}
+  <p class="text-center text-sm text-stone-500 dark:text-stone-400 mt-4">
     {#if mode === 'login'}
       No account? <button onclick={() => (mode = 'register')} class="underline">Register</button>
     {:else}
       Already have an account? <button onclick={() => (mode = 'login')} class="underline">Sign in</button>
     {/if}
   </p>
+  {/if}
 </div>
