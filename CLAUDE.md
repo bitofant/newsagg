@@ -14,6 +14,8 @@
 
 A personal news aggregator that collects articles from RSS feeds, consolidates them into topics using LLMs, and generates personalized newspaper-style front pages per user. Single-process architecture: one Node.js process + one SQLite file + Ollama.
 
+**This is a public GitHub repository.** Never commit user-specific data, secrets, or personal configuration. All such values must live in gitignored files (`config.json`, `.jwt_secret`, `*.db`). Committed code must only contain templates (`config.example.json`) and sensible defaults.
+
 ## Architecture
 
 ### Components
