@@ -7,6 +7,46 @@ const TOPIC_PAGE_SIZE = 50
 const ARTICLE_BATCH_SIZE = 10
 const DRAIN_INTERVAL_MS = 5_000
 
+/** Hardcoded max_tokens in src/ai/index.ts — must match. */
+const MAX_OUTPUT_TOKENS = 4096
+/** Slack for tokenization inaccuracy and unexpected prompt expansion. */
+const BUDGET_SAFETY_MARGIN = 256
+/** Minimum input budget: even a tiny context window should fit something. */
+const MIN_INPUT_BUDGET = 512
+
+/** Rough estimate: ~4 chars per token. Good enough for prompt sizing (failure mode is a smaller chunk, not a rejected call). */
+function estimateTokens(s: string): number {
+  return Math.ceil(s.length / 4)
+}
+
+/** Tokens available for dynamic prompt content, given the fixed instruction overhead for a call. */
+function inputBudget(ai: AiClient, fixedOverheadTokens: number): number {
+  return Math.max(
+    MIN_INPUT_BUDGET,
+    ai.maxContextTokens - MAX_OUTPUT_TOKENS - fixedOverheadTokens - BUDGET_SAFETY_MARGIN,
+  )
+}
+
+/** Split items into chunks such that each chunk's rendered tokens fit within `budget`. */
+function chunkByTokens<T>(items: T[], rendered: string[], budget: number): T[][] {
+  if (items.length === 0) return []
+  const chunks: T[][] = []
+  let current: T[] = []
+  let currentTokens = 0
+  for (let i = 0; i < items.length; i++) {
+    const t = estimateTokens(rendered[i])
+    if (current.length > 0 && currentTokens + t > budget) {
+      chunks.push(current)
+      current = []
+      currentTokens = 0
+    }
+    current.push(items[i])
+    currentTokens += t
+  }
+  if (current.length > 0) chunks.push(current)
+  return chunks
+}
+
 /** Strip markdown code fences (```json ... ```) that LLMs often wrap around JSON responses */
 function stripCodeFences(text: string): string {
   const trimmed = text.trim()
@@ -19,6 +59,7 @@ export interface Consolidator {
   enqueue(article: RawArticle): void
   /** Remove an article from a topic and re-classify it against other topics */
   ungroupArticle(articleId: number, topicId: number): Promise<{ newTopicIds: number[] }>
+  status(): { bufferDepth: number; processing: boolean }
   start(): void
   stop(): void
 }
@@ -73,67 +114,96 @@ export function createConsolidator({ db, ai }: { db: Db; ai: AiClient }): Consol
       offset += TOPIC_PAGE_SIZE
     }
 
-    // Save matched articles, create new topics for unmatched
+    // Phase 1: Save all matched articles to DB and collect assessment pairs
+    interface AssessmentPair {
+      article: RawArticle
+      savedId: number
+      topic: Topic
+      recentArticleTitles: string[]
+    }
+    const assessmentPairs: AssessmentPair[] = []
+
     for (let i = 0; i < articles.length; i++) {
       const topics = matchesByIndex.get(i)
       if (topics && topics.length > 0) {
-        await saveMatchedArticle(articles[i], topics)
-      } else {
-        await saveNewTopic(articles[i])
+        const saved = db.news.addArticle({
+          topicIds: topics.map((t) => t.id),
+          source: articles[i].source,
+          url: articles[i].url,
+          title: articles[i].title,
+          text: articles[i].text,
+        })
+        for (const topic of topics) {
+          db.news.updateTopicTimestamp(topic.id)
+          const recentArticleTitles = db.news
+            .listRecentArticlesByTopic(topic.id, 6)
+            .filter((a) => a.id !== saved.id)
+            .slice(0, 5)
+            .map((a) => a.title)
+          assessmentPairs.push({ article: articles[i], savedId: saved.id, topic, recentArticleTitles })
+        }
       }
     }
-  }
 
-  async function saveMatchedArticle(article: RawArticle, topics: Topic[]): Promise<void> {
-    const saved = db.news.addArticle({
-      topicIds: topics.map((t) => t.id),
-      source: article.source,
-      url: article.url,
-      title: article.title,
-      text: article.text,
-    })
+    // Phase 2: Batch-assess all article-topic pairs in one LLM call
+    const assessments = assessmentPairs.length > 0
+      ? await assessArticleBatch(ai, assessmentPairs)
+      : []
 
-    for (const topic of topics) {
-      db.news.updateTopicTimestamp(topic.id)
-
-      const recentArticleTitles = db.news
-        .listRecentArticlesByTopic(topic.id, 6)
-        .filter((a) => a.id !== saved.id)
-        .slice(0, 5)
-        .map((a) => a.title)
-
-      const assessment = await assessArticle(ai, article, topic, recentArticleTitles)
+    // Phase 3: Process assessment results (signals, summary regen)
+    const topicsNeedingSummary: number[] = []
+    for (let i = 0; i < assessmentPairs.length; i++) {
+      const pair = assessmentPairs[i]
+      const assessment = assessments[i] ?? { isSubstantial: false, isConcluded: false }
 
       if (assessment.isSubstantial) {
-        db.users.enqueueSignalForAllUsers({ type: 'substantial_new_info', topicId: topic.id, articleId: saved.id })
-        db.users.unreadTopicForNonDownvoters(topic.id)
+        db.users.enqueueSignalForAllUsers({ type: 'substantial_new_info', topicId: pair.topic.id, articleId: pair.savedId })
+        db.users.unreadTopicForNonDownvoters(pair.topic.id)
       } else {
-        db.users.enqueueSignalForAllUsers({ type: 'added_to_topic', topicId: topic.id, articleId: saved.id })
+        db.users.enqueueSignalForAllUsers({ type: 'added_to_topic', topicId: pair.topic.id, articleId: pair.savedId })
       }
 
       if (assessment.isConcluded) {
-        db.users.enqueueSignalForAllUsers({ type: 'concluded_issue', topicId: topic.id, articleId: saved.id })
+        db.users.enqueueSignalForAllUsers({ type: 'concluded_issue', topicId: pair.topic.id, articleId: pair.savedId })
       }
 
-      // Generate or regenerate topic summary
-      const articleCount = db.news.getArticleCountByTopic(topic.id)
-      if (assessment.isSubstantial || (articleCount >= 2 && !topic.summary)) {
-        await regenerateTopicSummary(ai, db, topic.id)
+      const articleCount = db.news.getArticleCountByTopic(pair.topic.id)
+      if (assessment.isSubstantial || (articleCount >= 2 && !pair.topic.summary)) {
+        if (!topicsNeedingSummary.includes(pair.topic.id)) {
+          topicsNeedingSummary.push(pair.topic.id)
+        }
       }
     }
-  }
 
-  async function saveNewTopic(article: RawArticle): Promise<void> {
-    const { title, description } = await generateTopicSummary(ai, article)
-    const topic = db.news.createTopic(title, description)
-    const saved = db.news.addArticle({
-      topicIds: [topic.id],
-      source: article.source,
-      url: article.url,
-      title: article.title,
-      text: article.text,
-    })
-    db.users.enqueueSignalForAllUsers({ type: 'new_topic', topicId: topic.id, articleId: saved.id })
+    // Phase 4: Batch-regenerate summaries for all topics that need it
+    if (topicsNeedingSummary.length > 0) {
+      await regenerateTopicSummaries(ai, db, topicsNeedingSummary)
+    }
+
+    // Phase 5: Batch-create new topics for unmatched articles
+    const unmatchedArticles: RawArticle[] = []
+    for (let i = 0; i < articles.length; i++) {
+      const topics = matchesByIndex.get(i)
+      if (!topics || topics.length === 0) {
+        unmatchedArticles.push(articles[i])
+      }
+    }
+
+    if (unmatchedArticles.length > 0) {
+      const newTopicInfos = await generateTopicSummaries(ai, unmatchedArticles)
+      for (let i = 0; i < unmatchedArticles.length; i++) {
+        const info = newTopicInfos[i]
+        const topic = db.news.createTopic(info.title, info.description)
+        const saved = db.news.addArticle({
+          topicIds: [topic.id],
+          source: unmatchedArticles[i].source,
+          url: unmatchedArticles[i].url,
+          title: unmatchedArticles[i].title,
+          text: unmatchedArticles[i].text,
+        })
+        db.users.enqueueSignalForAllUsers({ type: 'new_topic', topicId: topic.id, articleId: saved.id })
+      }
+    }
   }
 
   async function ungroupArticle(articleId: number, topicId: number): Promise<{ newTopicIds: number[] }> {
@@ -200,6 +270,9 @@ export function createConsolidator({ db, ai }: { db: Db; ai: AiClient }): Consol
   return {
     enqueue,
     ungroupArticle,
+    status() {
+      return { bufferDepth: buffer.length, processing }
+    },
     start() {
       timer = setInterval(drain, DRAIN_INTERVAL_MS)
     },
@@ -219,44 +292,46 @@ async function matchBatchAgainstTopics(
   articles: RawArticle[],
   topics: Topic[],
 ): Promise<BatchMatchEntry[]> {
-  const topicList = topics.map((t) => `${t.id}: ${t.title} — ${t.description}`).join('\n')
+  if (topics.length === 0 || articles.length === 0) return []
 
   const articleList = articles
     .map((a, i) => `${i}: ${a.title} — ${a.text.slice(0, 200)}`)
     .join('\n')
 
-  const response = await ai.complete(
-    `You are a news editor. Match new articles to existing topics.
+  // Fixed overhead = instructions + article list (articles are constant across topic sub-chunks)
+  const instructionsPrefix = `You are a news editor. Match new articles to existing topics.\n\nExisting topics:\n`
+  const instructionsSuffix = `\n\nNew articles:\n${articleList}\n\nFor each article, decide which existing topics it belongs to. An article may match multiple topics if it covers multiple subjects. Only match if the article contains substantial information about that topic — a passing mention is not enough.\nReply with a JSON array. Each entry has "article" (the article index number) and "topicIds" (an array of matching topic ID numbers, or an empty array if no match).\n\nExample: [{"article": 0, "topicIds": [5, 12]}, {"article": 1, "topicIds": []}]\n\nReply with ONLY the JSON array, no other text.`
+  const fixedOverhead = estimateTokens(instructionsPrefix + instructionsSuffix)
 
-Existing topics:
-${topicList}
-
-New articles:
-${articleList}
-
-For each article, decide which existing topics it belongs to. An article may match multiple topics if it covers multiple subjects. Only match if the article contains substantial information about that topic — a passing mention is not enough.
-Reply with a JSON array. Each entry has "article" (the article index number) and "topicIds" (an array of matching topic ID numbers, or an empty array if no match).
-
-Example: [{"article": 0, "topicIds": [5, 12]}, {"article": 1, "topicIds": []}]
-
-Reply with ONLY the JSON array, no other text.`,
-  )
+  const renderedTopics = topics.map((t) => `${t.id}: ${t.title} — ${t.description}`)
+  const chunks = chunkByTokens(topics, renderedTopics, inputBudget(ai, fixedOverhead))
 
   const entries: BatchMatchEntry[] = []
 
-  try {
-    const results = JSON.parse(stripCodeFences(response)) as { article: number; topicIds: number[] }[]
-    for (const result of results) {
-      if (!result.topicIds || result.topicIds.length === 0) continue
-      const matchedTopics = result.topicIds
-        .map((id) => topics.find((t) => t.id === id))
-        .filter((t): t is Topic => !!t)
-      if (matchedTopics.length > 0) {
-        entries.push({ articleIndex: result.article, topics: matchedTopics })
+  for (const chunk of chunks) {
+    const topicList = chunk.map((t) => `${t.id}: ${t.title} — ${t.description}`).join('\n')
+    const response = await ai.complete(instructionsPrefix + topicList + instructionsSuffix)
+
+    try {
+      const results = JSON.parse(stripCodeFences(response)) as { article: number; topicIds: number[] }[]
+      for (const result of results) {
+        if (!result.topicIds || result.topicIds.length === 0) continue
+        const matchedTopics = result.topicIds
+          .map((id) => chunk.find((t) => t.id === id))
+          .filter((t): t is Topic => !!t)
+        if (matchedTopics.length > 0) {
+          // Merge into existing entry if one exists for this article index
+          const existing = entries.find((e) => e.articleIndex === result.article)
+          if (existing) {
+            existing.topics.push(...matchedTopics)
+          } else {
+            entries.push({ articleIndex: result.article, topics: matchedTopics })
+          }
+        }
       }
+    } catch {
+      console.error('[consolidator] failed to parse batch match response, treating chunk as unmatched:', response)
     }
-  } catch {
-    console.error('[consolidator] failed to parse batch match response, treating all as unmatched:', response)
   }
 
   return entries
@@ -281,33 +356,167 @@ Reply with JSON only: { "title": "short topic title", "description": "one senten
   }
 }
 
-async function regenerateTopicSummary(ai: AiClient, db: Db, topicId: number): Promise<void> {
-  const articles = db.news.listRecentArticlesByTopic(topicId, 10)
-  if (articles.length < 2) return
-
-  const articleContext = articles
-    .map((a) => `- "${a.title}" (${a.source}): ${a.text.slice(0, 200)}`)
-    .join('\n')
-
-  const topic = db.news.listTopics().find((t) => t.id === topicId)
-  if (!topic) return
-
-  try {
-    const response = await ai.complete(
-      `You are a news editor. Write a concise 2-3 sentence summary of this news topic based on the latest articles.\n` +
-        `Some articles may cover multiple topics — focus ONLY on aspects relevant to this specific topic.\n\n` +
-        `Topic: ${topic.title}\n` +
-        `Background: ${topic.description}\n\n` +
-        `Recent articles:\n${articleContext}\n\n` +
-        `Reply with ONLY the summary text, no JSON, no formatting.`,
-    )
-    const summary = response.trim()
-    if (summary) {
-      db.news.updateTopicSummary(topicId, summary)
-    }
-  } catch {
-    console.error(`[consolidator] failed to generate summary for topic ${topicId}`)
+/** Batch-generate topic summaries for multiple unmatched articles in one or more LLM calls */
+async function generateTopicSummaries(
+  ai: AiClient,
+  articles: RawArticle[],
+): Promise<{ title: string; description: string }[]> {
+  if (articles.length === 0) return []
+  if (articles.length === 1) {
+    return [await generateTopicSummary(ai, articles[0])]
   }
+
+  const instructionsPrefix = `You are a news editor. Create topic entries for each of these new articles.\n\nArticles:\n`
+  const instructionsSuffix = `\n\nFor each article, create a topic with a short title and a one-sentence terse description.\nReply with a JSON array where each entry has "index" (the article number), "title", and "description".\n\nExample: [{"index": 0, "title": "...", "description": "..."}, {"index": 1, "title": "...", "description": "..."}]\n\nReply with ONLY the JSON array, no other text.`
+  const fixedOverhead = estimateTokens(instructionsPrefix + instructionsSuffix)
+
+  // Build results with fallbacks (overridden on successful parse)
+  const results: { title: string; description: string }[] = articles.map((a) => ({
+    title: a.title.slice(0, 80),
+    description: a.text.slice(0, 120),
+  }))
+
+  // Render with placeholder index; we'll renumber per chunk to keep LLM indices 0-based per call
+  const renderedItems = articles.map((a) => `"${a.title}" — ${a.text.slice(0, 300)}`)
+  const indexes = articles.map((_, i) => i)
+  const chunks = chunkByTokens(indexes, renderedItems, inputBudget(ai, fixedOverhead))
+
+  for (const chunk of chunks) {
+    // Single-item chunk: use simpler prompt for better results
+    if (chunk.length === 1) {
+      results[chunk[0]] = await generateTopicSummary(ai, articles[chunk[0]])
+      continue
+    }
+
+    const articleList = chunk
+      .map((originalIndex, localIndex) => `${localIndex}: "${articles[originalIndex].title}" — ${articles[originalIndex].text.slice(0, 300)}`)
+      .join('\n\n')
+
+    const response = await ai.complete(instructionsPrefix + articleList + instructionsSuffix)
+
+    try {
+      const parsed = JSON.parse(stripCodeFences(response)) as { index: number; title: string; description: string }[]
+      for (const entry of parsed) {
+        if (entry.index >= 0 && entry.index < chunk.length && entry.title && entry.description) {
+          const originalIndex = chunk[entry.index]
+          results[originalIndex] = { title: entry.title, description: entry.description }
+        }
+      }
+    } catch {
+      console.error('[consolidator] failed to parse batch topic summaries chunk, using fallbacks:', response)
+    }
+  }
+
+  return results
+}
+
+/** Batch-regenerate summaries for multiple topics in one LLM call */
+async function regenerateTopicSummaries(ai: AiClient, db: Db, topicIds: number[]): Promise<void> {
+  // Gather context for each topic
+  interface TopicContext {
+    topicId: number
+    topic: Topic
+    articleContext: string
+  }
+  const contexts: TopicContext[] = []
+
+  for (const topicId of topicIds) {
+    const articles = db.news.listRecentArticlesByTopic(topicId, 10)
+    if (articles.length < 2) continue
+    const topic = db.news.listTopics().find((t) => t.id === topicId)
+    if (!topic) continue
+    const articleContext = articles
+      .map((a) => `- "${a.title}" (${a.source}): ${a.text.slice(0, 200)}`)
+      .join('\n')
+    contexts.push({ topicId, topic, articleContext })
+  }
+
+  if (contexts.length === 0) return
+
+  // Single topic — use simpler prompt
+  if (contexts.length === 1) {
+    const ctx = contexts[0]
+    try {
+      const response = await ai.complete(
+        `You are a news editor. Write a concise 2-3 sentence summary of this news topic based on the latest articles.\n` +
+          `Some articles may cover multiple topics — focus ONLY on aspects relevant to this specific topic.\n\n` +
+          `Topic: ${ctx.topic.title}\n` +
+          `Background: ${ctx.topic.description}\n\n` +
+          `Recent articles:\n${ctx.articleContext}\n\n` +
+          `Reply with ONLY the summary text, no JSON, no formatting.`,
+      )
+      const summary = response.trim()
+      if (summary) {
+        db.news.updateTopicSummary(ctx.topicId, summary)
+      }
+    } catch {
+      console.error(`[consolidator] failed to generate summary for topic ${ctx.topicId}`)
+    }
+    return
+  }
+
+  // Multiple topics — split by token budget and batch each chunk
+  const instructionsPrefix = `You are a news editor. Write concise 2-3 sentence summaries for each of the following news topics based on their latest articles.\nSome articles may cover multiple topics — focus ONLY on aspects relevant to each specific topic.\n\n`
+  const instructionsSuffix = `\n\nReply with a JSON array where each entry has "topicId" (the topic ID number) and "summary" (the 2-3 sentence summary text).\n\nExample: [{"topicId": 5, "summary": "..."}, {"topicId": 12, "summary": "..."}]\n\nReply with ONLY the JSON array, no other text.`
+  const fixedOverhead = estimateTokens(instructionsPrefix + instructionsSuffix)
+
+  const renderedContexts = contexts.map(
+    (ctx) =>
+      `Topic ${ctx.topicId}: "${ctx.topic.title}"\nBackground: ${ctx.topic.description}\nRecent articles:\n${ctx.articleContext}`,
+  )
+  const chunks = chunkByTokens(contexts, renderedContexts, inputBudget(ai, fixedOverhead))
+
+  for (const chunk of chunks) {
+    // Single-context chunk: use simpler single-topic prompt path
+    if (chunk.length === 1) {
+      const ctx = chunk[0]
+      try {
+        const response = await ai.complete(
+          `You are a news editor. Write a concise 2-3 sentence summary of this news topic based on the latest articles.\n` +
+            `Some articles may cover multiple topics — focus ONLY on aspects relevant to this specific topic.\n\n` +
+            `Topic: ${ctx.topic.title}\n` +
+            `Background: ${ctx.topic.description}\n\n` +
+            `Recent articles:\n${ctx.articleContext}\n\n` +
+            `Reply with ONLY the summary text, no JSON, no formatting.`,
+        )
+        const summary = response.trim()
+        if (summary) {
+          db.news.updateTopicSummary(ctx.topicId, summary)
+        }
+      } catch {
+        console.error(`[consolidator] failed to generate summary for topic ${ctx.topicId}`)
+      }
+      continue
+    }
+
+    const topicList = chunk
+      .map(
+        (ctx) =>
+          `Topic ${ctx.topicId}: "${ctx.topic.title}"\nBackground: ${ctx.topic.description}\nRecent articles:\n${ctx.articleContext}`,
+      )
+      .join('\n\n---\n\n')
+
+    try {
+      const response = await ai.complete(instructionsPrefix + topicList + instructionsSuffix)
+
+      const parsed = JSON.parse(stripCodeFences(response)) as { topicId: number; summary: string }[]
+      for (const entry of parsed) {
+        if (entry.topicId && entry.summary?.trim()) {
+          const ctx = chunk.find((c) => c.topicId === entry.topicId)
+          if (ctx) {
+            db.news.updateTopicSummary(entry.topicId, entry.summary.trim())
+          }
+        }
+      }
+    } catch {
+      console.error('[consolidator] failed to parse batch summary regeneration chunk, skipping')
+    }
+  }
+}
+
+/** Single-article assessment (used by ungroupArticle) */
+async function regenerateTopicSummary(ai: AiClient, db: Db, topicId: number): Promise<void> {
+  return regenerateTopicSummaries(ai, db, [topicId])
 }
 
 interface ArticleAssessment {
@@ -315,44 +524,104 @@ interface ArticleAssessment {
   isConcluded: boolean
 }
 
-async function assessArticle(
+interface AssessmentPairInput {
+  article: RawArticle
+  savedId: number
+  topic: Topic
+  recentArticleTitles: string[]
+}
+
+/** Batch-assess multiple article-topic pairs in one LLM call */
+async function assessArticleBatch(
   ai: AiClient,
-  article: RawArticle,
-  topic: Topic,
-  recentArticleTitles: string[],
-): Promise<ArticleAssessment> {
-  const recentContext =
-    recentArticleTitles.length > 0
-      ? `Recent articles on this topic:\n${recentArticleTitles.map((t) => `- ${t}`).join('\n')}`
-      : 'This is the first follow-up article on this topic.'
+  pairs: AssessmentPairInput[],
+): Promise<ArticleAssessment[]> {
+  if (pairs.length === 1) {
+    // Single pair — use simpler prompt
+    const pair = pairs[0]
+    const recentContext =
+      pair.recentArticleTitles.length > 0
+        ? `Recent articles on this topic:\n${pair.recentArticleTitles.map((t) => `- ${t}`).join('\n')}`
+        : 'This is the first follow-up article on this topic.'
 
-  const response = await ai.complete(
-    `You are a news editor. Assess this new article in the context of an ongoing topic.
+    const response = await ai.complete(
+      `You are a news editor. Assess this new article in the context of an ongoing topic.
 
-Topic: ${topic.title}
-Background: ${topic.description}
+Topic: ${pair.topic.title}
+Background: ${pair.topic.description}
 
 ${recentContext}
 
 New article:
-Title: ${article.title}
-Text: ${article.text.slice(0, 300)}
+Title: ${pair.article.title}
+Text: ${pair.article.text.slice(0, 300)}
 
 Determine:
 1. "isSubstantial": Is this a major new development (not just a routine update or minor rehash)?
 2. "isConcluded": Does this article indicate the issue/story has reached a conclusion or resolution (e.g., final verdict, deal closed, crisis resolved, investigation completed)?
 
 Reply with ONLY JSON: {"isSubstantial": true/false, "isConcluded": true/false}`,
-  )
+    )
 
-  try {
-    const json = JSON.parse(stripCodeFences(response)) as ArticleAssessment
-    return {
-      isSubstantial: !!json.isSubstantial,
-      isConcluded: !!json.isConcluded,
+    try {
+      const json = JSON.parse(stripCodeFences(response)) as ArticleAssessment
+      return [{ isSubstantial: !!json.isSubstantial, isConcluded: !!json.isConcluded }]
+    } catch {
+      console.error('[consolidator] failed to parse article assessment, defaulting:', response)
+      return [{ isSubstantial: false, isConcluded: false }]
     }
-  } catch {
-    console.error('[consolidator] failed to parse article assessment, defaulting to non-substantial/non-concluded:', response)
-    return { isSubstantial: false, isConcluded: false }
   }
+
+  // Multiple pairs — split by token budget and batch each chunk
+  const instructionsPrefix = `You are a news editor. Assess each new article in the context of its topic.\n\nFor each pair below, determine:\n- "isSubstantial": Is this a major new development (not just a routine update or minor rehash)?\n- "isConcluded": Does this article indicate the story has reached a conclusion or resolution?\n\nPairs:\n`
+  const instructionsSuffix = `\n\nReply with a JSON array, one entry per pair in order:\n[{"index": 0, "isSubstantial": true/false, "isConcluded": true/false}, ...]\n\nReply with ONLY the JSON array, no other text.`
+  const fixedOverhead = estimateTokens(instructionsPrefix + instructionsSuffix)
+
+  function renderPair(pair: AssessmentPairInput, localIndex: number): string {
+    const recentContext =
+      pair.recentArticleTitles.length > 0
+        ? `Recent: ${pair.recentArticleTitles.join('; ')}`
+        : 'First follow-up.'
+    return `${localIndex}. Topic: "${pair.topic.title}" (${pair.topic.description}). ${recentContext}\n   Article: "${pair.article.title}" — ${pair.article.text.slice(0, 200)}`
+  }
+
+  // Default all to non-substantial/non-concluded (overridden on successful parse)
+  const results: ArticleAssessment[] = pairs.map(() => ({ isSubstantial: false, isConcluded: false }))
+
+  // Render each pair once for budgeting (local index 0 — cheap enough, exact wording irrelevant for size)
+  const renderedPairs = pairs.map((p, i) => renderPair(p, i))
+  const pairIndexes = pairs.map((_, i) => i)
+  const chunks = chunkByTokens(pairIndexes, renderedPairs, inputBudget(ai, fixedOverhead))
+
+  for (const chunk of chunks) {
+    // Single-pair chunk: recurse into the single-pair fast path above
+    if (chunk.length === 1) {
+      const single = await assessArticleBatch(ai, [pairs[chunk[0]]])
+      results[chunk[0]] = single[0]
+      continue
+    }
+
+    const pairList = chunk
+      .map((originalIndex, localIndex) => renderPair(pairs[originalIndex], localIndex))
+      .join('\n\n')
+
+    const response = await ai.complete(instructionsPrefix + pairList + instructionsSuffix)
+
+    try {
+      const parsed = JSON.parse(stripCodeFences(response)) as { index: number; isSubstantial: boolean; isConcluded: boolean }[]
+      for (const entry of parsed) {
+        if (entry.index >= 0 && entry.index < chunk.length) {
+          const originalIndex = chunk[entry.index]
+          results[originalIndex] = {
+            isSubstantial: !!entry.isSubstantial,
+            isConcluded: !!entry.isConcluded,
+          }
+        }
+      }
+    } catch {
+      console.error('[consolidator] failed to parse batch assessment chunk, defaulting to non-substantial/non-concluded:', response)
+    }
+  }
+
+  return results
 }

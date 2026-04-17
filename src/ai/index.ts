@@ -4,6 +4,8 @@ import type { AiConfig } from '../config.js'
 
 export interface AiClient {
   complete(prompt: string, systemPrompt?: string): Promise<string>
+  /** Configured max input context tokens. Callers use this to size batched prompts. */
+  readonly maxContextTokens: number
 }
 
 const LLM_LOG_DIR = './llm'
@@ -73,5 +75,5 @@ export function createAi(config: AiConfig): AiClient {
     return msg.content
   }
 
-  return { complete }
+  return { complete, maxContextTokens: config.maxContextTokens }
 }
