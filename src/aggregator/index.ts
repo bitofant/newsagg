@@ -29,6 +29,7 @@ export interface Aggregator {
   stop(): void
   /** Returns the latest front page for a user, or null if none generated yet */
   getLatestFrontPage(userId: number): FrontPage | null
+  status(): { queueLength: number; activeWorkers: number }
 }
 
 const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000
@@ -227,6 +228,9 @@ export function createAggregator({
       const row = db.users.getLatestFrontPage(userId)
       if (!row) return null
       return JSON.parse(row.data) as FrontPage
+    },
+    status() {
+      return { queueLength: queue.length, activeWorkers }
     },
   }
 }

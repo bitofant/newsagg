@@ -231,6 +231,34 @@ export async function createServer({ db, aggregator, consolidator, profiler, con
     await reply.hijack()
   })
 
+  // --- Status ---
+
+  app.get('/api/status', async () => {
+    const now = Date.now()
+    const users = db.users.listAllUsers().map((user) => {
+      const lastFrontPage = db.users.getLastFrontPageTime(user.id)
+      const elapsed = lastFrontPage != null ? now - lastFrontPage : null
+      const overdue = elapsed != null ? elapsed > user.intervalMs : true
+      const signals = db.users.readSignalsInWindow(user.id, 14 * 24 * 60 * 60 * 1000)
+      return {
+        id: user.id,
+        email: user.email,
+        intervalMs: user.intervalMs,
+        lastFrontPageAt: lastFrontPage ?? null,
+        overdueBy: overdue ? (elapsed != null ? elapsed - user.intervalMs : null) : 0,
+        recentSignalCount: signals.length,
+      }
+    })
+
+    return {
+      timestamp: now,
+      consolidator: consolidator.status(),
+      aggregator: aggregator.status(),
+      db: { topicCount: db.news.topicCount(), totalArticles: db.news.totalArticleCount() },
+      users,
+    }
+  })
+
   // Fallback: serve SvelteKit's index.html for client-side routing
   app.setNotFoundHandler((_req, reply) => {
     reply.sendFile('index.html')

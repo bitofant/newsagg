@@ -45,6 +45,7 @@ export interface NewsDb {
   getArticleById(id: number): Article | undefined
   unlinkArticleFromTopic(articleId: number, topicId: number): void
   deleteTopic(id: number): void
+  totalArticleCount(): number
 }
 
 // IMPLEMENTED
@@ -92,6 +93,11 @@ export function createNewsDb(db: DatabaseSync): NewsDb {
 
     topicCount() {
       const row = db.prepare('SELECT COUNT(*) as count FROM topics').get() as { count: number }
+      return row.count
+    },
+
+    totalArticleCount() {
+      const row = db.prepare('SELECT COUNT(*) as count FROM articles').get() as { count: number }
       return row.count
     },
 

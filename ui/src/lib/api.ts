@@ -114,6 +114,27 @@ export async function updatePreferences(prefs: Preferences): Promise<void> {
   if (!res.ok) throw new Error((await res.json() as { error: string }).error)
 }
 
+export interface Status {
+  timestamp: number
+  consolidator: { bufferDepth: number; processing: boolean }
+  aggregator: { queueLength: number; activeWorkers: number }
+  db: { topicCount: number; totalArticles: number }
+  users: {
+    id: number
+    email: string
+    intervalMs: number
+    lastFrontPageAt: number | null
+    overdueBy: number | null
+    recentSignalCount: number
+  }[]
+}
+
+export async function getStatus(): Promise<Status> {
+  const res = await fetch(`${BASE}/status`)
+  if (!res.ok) throw new Error('Failed to load status')
+  return res.json() as Promise<Status>
+}
+
 export function subscribeToFrontPage(
   onUpdate: (generatedAt: number) => void,
 ): () => void {
