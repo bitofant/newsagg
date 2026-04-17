@@ -5,6 +5,7 @@ export interface Config {
   dbPath: string
   ai: AiConfig
   feeds: string[]
+  consolidator: ConsolidatorConfig
   aggregator: AggregatorConfig
   server: ServerConfig
 }
@@ -15,6 +16,13 @@ export interface AiConfig {
   thinkingEffort: 'low' | 'medium' | 'high'
   maxContextTokens: number
   apiKey?: string
+  /** Rolling window (ms) for LLM call metrics on /status. Default: 10 minutes. */
+  statusWindowMs: number
+}
+
+export interface ConsolidatorConfig {
+  /** Rolling window (ms) for processing activity metrics on /status. Default: 10 minutes. */
+  statusWindowMs: number
 }
 
 export interface AggregatorConfig {
@@ -49,8 +57,12 @@ function loadConfig(): Config {
       thinkingEffort: raw.ai?.thinkingEffort ?? 'medium',
       maxContextTokens: raw.ai?.maxContextTokens ?? 8192,
       apiKey: raw.ai?.apiKey,
+      statusWindowMs: raw.ai?.statusWindowMs ?? 10 * 60 * 1000,
     },
     feeds: raw.feeds ?? [],
+    consolidator: {
+      statusWindowMs: raw.consolidator?.statusWindowMs ?? 10 * 60 * 1000,
+    },
     aggregator: {
       intervalMs: raw.aggregator?.intervalMs ?? 15 * 60 * 1000,
       workers: raw.aggregator?.workers ?? 2,

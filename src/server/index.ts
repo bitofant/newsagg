@@ -4,15 +4,19 @@ import path from 'path'
 import bcrypt from 'bcrypt'
 import jwt from 'jsonwebtoken'
 import { randomBytes } from 'node:crypto'
-import { readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, statSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import type { ServerResponse } from 'http'
 import type { Db } from '../db/index.js'
+import type { AiClient } from '../ai/index.js'
 import type { Aggregator } from '../aggregator/index.js'
 import type { Consolidator } from '../consolidator/index.js'
 import type { Profiler } from '../profiler/index.js'
 import type { ServerConfig } from '../config.js'
 
 const JWT_SECRET = loadJwtSecret()
+const STARTED_AT = Date.now()
+const BUILT_AT = statSync(fileURLToPath(import.meta.url)).mtimeMs
 
 function loadJwtSecret(): string {
   if (process.env['JWT_SECRET']) return process.env['JWT_SECRET']
@@ -31,6 +35,7 @@ function loadJwtSecret(): string {
 
 export interface ServerOptions {
   db: Db
+  ai: AiClient
   aggregator: Aggregator
   consolidator: Consolidator
   profiler: Profiler
@@ -38,7 +43,7 @@ export interface ServerOptions {
 }
 
 // IMPLEMENTED: auth routes, front page API, voting endpoint, user preferences, SSE push for new front pages
-export async function createServer({ db, aggregator, consolidator, profiler, config }: ServerOptions) {
+export async function createServer({ db, ai, aggregator, consolidator, profiler, config }: ServerOptions) {
   const app = Fastify({ logger: true })
 
   // SSE connections: userId -> set of active response streams
@@ -252,6 +257,9 @@ export async function createServer({ db, aggregator, consolidator, profiler, con
 
     return {
       timestamp: now,
+      startedAt: STARTED_AT,
+      builtAt: BUILT_AT,
+      llm: ai.status(),
       consolidator: consolidator.status(),
       aggregator: aggregator.status(),
       db: { topicCount: db.news.topicCount(), totalArticles: db.news.totalArticleCount() },
