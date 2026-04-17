@@ -21,8 +21,9 @@ A personal news aggregator that collects articles from RSS feeds, consolidates t
 ### Components
 
 1. **AI** (`src/ai/`) - LLM wrapper (OpenAI-compatible API, targeting Ollama)
-   - Config: model name, thinking effort, URL, optional credentials, max context size
+   - Config: model name, thinking effort, URL, optional credentials, max context size, status window
    - **LLM call logging**: every `complete()` call writes 3 files to `llm/{YYYYMMDD}/` (gitignored): `{unix_ts}.req` (request JSON), `{unix_ts}.res` (response text), `{unix_ts}.think` (reasoning tokens, if present). Fire-and-forget, never blocks inference. Useful for debugging prompt issues or unexpected LLM output.
+   - **Call metrics**: each `complete()` records `{startedAt, endedAt, promptTokens, completionTokens}` in a rolling window (`ai.statusWindowMs`, default 10 min). Surfaced via `status()` as `busyPct` (% of window spent in LLM calls; can exceed 100% if calls overlap), `reqPerMin`, `tokPerSec`. Token counts come from OpenAI-compatible `usage` field (0 if absent).
 
 2. **News DB** (`src/db/news.ts`) - Hierarchical article storage (SQLite)
    - High-level topic list with terse descriptions (used by consolidator for matching)
@@ -43,7 +44,7 @@ A personal news aggregator that collects articles from RSS feeds, consolidates t
    - No dedup — that's the consolidator's job via DB
 
 5. **Consolidator** (`src/consolidator/`) - Topic matching, signal generation & summary generation
-   - Internal async queue: `enqueue()` buffers articles, drain loop processes every 5s
+   - Internal async queue: `enqueue()` dedups against an in-memory pending set + DB (`articleExistsByUrl`) and buffers articles; drain loop processes every 5s
    - Batches up to 10 articles, matches against topics in pages of 50 (newest first)
    - Multi-topic matching: an article can match multiple existing topics (e.g., a roundup article covering several subjects)
    - Creates new topics or appends to existing ones
@@ -54,6 +55,7 @@ A personal news aggregator that collects articles from RSS feeds, consolidates t
    - **Topic summary generation**: generates/regenerates a 2-3 sentence LLM summary when a topic reaches 2+ articles or when `substantial_new_info` is detected; stored in `topics.summary` column
    - **Read-state reset on substantial news**: when `substantial_new_info` is detected, the topic's read flag is removed for all users except those who downvoted (thumbs down) an article in that topic — ensures users see important developments even if they previously marked the topic as read
    - **Article ungrouping**: `ungroupArticle(articleId, topicId)` removes an article from a topic and re-classifies it via the same paginated LLM matching (excluding the source topic); falls back to creating a new standalone topic if no match found; cleans up empty topics
+   - **Batch timing history**: each drain records `{startedAt, endedAt, articleCount}` in a rolling window (size `consolidator.statusWindowMs`), surfaced via `status()` as `estimatedBehindMs` (buffer depth × avg ms/article) for the /status page. Note: LLM busy % is tracked separately in `src/ai/`, not here, because other components (aggregator, profiler) also consume LLM time.
    - PLANNED: embedding-based pre-filter
 
 6. **News Aggregator** (`src/aggregator/`) - Per-user front page generation
@@ -86,7 +88,7 @@ A personal news aggregator that collects articles from RSS feeds, consolidates t
    - SSE subscription for live front page updates (auto-refreshes on new generation)
    - Topic detail view: click "N sources" on a card to expand inline article list with titles (linked to original), source names, and relative timestamps; lazy-loaded via `GET /api/topics/:topicId/articles`
    - Per-article ungroup button (`Unlink2` icon) in expanded source list: removes article from topic and re-classifies it via `POST /api/topics/:topicId/articles/:articleId/ungroup`
-   - Status page at `/status` (no auth, not linked from nav): consolidator buffer depth + processing flag, aggregator queue length + active workers, topic/article counts, and per-user list with interval / last-front-page age / overdue status / 14-day signal count. Auto-refreshes every 5s. Data source: `GET /api/status`.
+   - Status page at `/status` (no auth, not linked from nav): LLM metrics (busy %, req/min, tok/s over `ai.statusWindowMs`), consolidator buffer depth + processing flag + estimated backlog duration, aggregator queue length + active workers, topic/article counts, a Deployable card (build time from mtime of `dist/server/index.js` + process uptime), and a per-user list with interval / last-front-page age / overdue status / 14-day signal count. All relative times tick every second. Auto-refreshes every 5s. Data source: `GET /api/status`.
 
 ### Implementation Status Tracking
 
@@ -102,7 +104,8 @@ All configuration lives in `config.json` at the project root (override path via 
 ```jsonc
 {
   "feeds": ["https://..."],           // RSS feed URLs
-  "ai": { "url", "model", "thinkingEffort", "maxContextTokens", "apiKey?" },
+  "ai": { "url", "model", "thinkingEffort", "maxContextTokens", "apiKey?", "statusWindowMs" },
+  "consolidator": { "statusWindowMs" },   // rolling window for /status busy % + backlog ETA
   "aggregator": { "intervalMs", "workers" },
   "server": { "port", "uiDir" },
   "dbPath": "./newsagg.db"
@@ -174,7 +177,7 @@ A log of non-obvious choices and course corrections. Read these before proposing
 
 5. **Front pages persisted in SQLite** (2026-04-07): Generated front pages are stored in a `front_pages` table, not an in-memory Map. This is consistent with decision #4 — if signals survive restarts, front pages should too. The aggregator reads from DB on demand rather than caching.
 
-6. **Grabber dedup is the consolidator's job** (2026-04-07): The grabber does not track seen URLs. It emits every article from every poll. The consolidator checks `articleExistsByUrl()` against SQLite, which is the authoritative dedup. This avoids a redundant in-memory Set that wouldn't survive restarts anyway.
+6. **Grabber dedup is the consolidator's job** (2026-04-07, updated 2026-04-17): The grabber does not track seen URLs. It emits every article from every poll. The consolidator dedups at `enqueue()` time against both an in-memory `pendingUrls: Set<string>` (mirrors the buffer) AND `db.news.articleExistsByUrl()` (indexed SQL lookup, very cheap). When items are spliced out of the buffer in `drain()`, their URLs are removed from the pending set. Rationale for updating: without `enqueue`-time dedup, a slow drain combined with 5-minute RSS re-polling caused the buffer to fill with duplicates (e.g. 3000+ entries representing ~100-300 distinct URLs, each duplicated 10-30×). The in-memory Set is accepted as a tradeoff — yes, it's lost on restart, but so is the buffer itself, and the DB check at `enqueue()` + the safety-net filter in `drain()` cover the restart case correctly.
 
 7. **Grabber → consolidator is decoupled via async queue** (2026-04-07): The grabber calls `consolidator.enqueue()` synchronously (just pushes to a buffer). The consolidator has its own drain loop that processes articles in batches every 5 seconds. This prevents a slow Ollama response from blocking RSS polling.
 

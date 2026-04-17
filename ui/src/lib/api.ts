@@ -116,7 +116,10 @@ export async function updatePreferences(prefs: Preferences): Promise<void> {
 
 export interface Status {
   timestamp: number
-  consolidator: { bufferDepth: number; processing: boolean }
+  startedAt: number
+  builtAt: number
+  llm: { busyPct: number; reqPerMin: number; tokPerSec: number; windowMs: number }
+  consolidator: { bufferDepth: number; processing: boolean; estimatedBehindMs: number | null }
   aggregator: { queueLength: number; activeWorkers: number }
   db: { topicCount: number; totalArticles: number }
   users: {

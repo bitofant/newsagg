@@ -1,4 +1,5 @@
 import type { AiClient } from '../ai/index.js'
+import type { ConsolidatorConfig } from '../config.js'
 import type { Db } from '../db/index.js'
 import type { RawArticle } from '../grabber/index.js'
 import type { Topic } from '../db/news.js'
@@ -59,20 +60,30 @@ export interface Consolidator {
   enqueue(article: RawArticle): void
   /** Remove an article from a topic and re-classify it against other topics */
   ungroupArticle(articleId: number, topicId: number): Promise<{ newTopicIds: number[] }>
-  status(): { bufferDepth: number; processing: boolean }
+  status(): {
+    bufferDepth: number
+    processing: boolean
+    estimatedBehindMs: number | null
+  }
   start(): void
   stop(): void
 }
 
 // IMPLEMENTED: batched topic matching with paginated topics, internal queue, concluded_issue detection
 // PLANNED: embedding-based pre-filter
-export function createConsolidator({ db, ai }: { db: Db; ai: AiClient }): Consolidator {
+export function createConsolidator({ db, ai, config }: { db: Db; ai: AiClient; config: ConsolidatorConfig }): Consolidator {
   const buffer: RawArticle[] = []
+  const pendingUrls = new Set<string>()
   let timer: ReturnType<typeof setInterval> | null = null
   let processing = false
+  const batchHistory: { startedAt: number; endedAt: number; articleCount: number }[] = []
 
   function enqueue(article: RawArticle) {
+    // Dedup: skip if already queued, or already saved to DB
+    if (pendingUrls.has(article.url)) return
+    if (db.news.articleExistsByUrl(article.url)) return
     buffer.push(article)
+    pendingUrls.add(article.url)
   }
 
   async function drain() {
@@ -81,12 +92,21 @@ export function createConsolidator({ db, ai }: { db: Db; ai: AiClient }): Consol
     try {
       // Take up to ARTICLE_BATCH_SIZE from the buffer
       const batch = buffer.splice(0, ARTICLE_BATCH_SIZE)
+      for (const a of batch) pendingUrls.delete(a.url)
 
-      // Filter out articles already in DB
+      // Safety net: filter out anything that landed in DB between enqueue and drain
       const fresh = batch.filter((a) => !db.news.articleExistsByUrl(a.url))
       if (fresh.length === 0) return
 
+      const startedAt = Date.now()
       await processBatch(fresh)
+      const endedAt = Date.now()
+
+      batchHistory.push({ startedAt, endedAt, articleCount: fresh.length })
+      const cutoff = endedAt - config.statusWindowMs
+      while (batchHistory.length > 0 && batchHistory[0].endedAt < cutoff) {
+        batchHistory.shift()
+      }
     } catch (err) {
       console.error('[consolidator] batch processing error:', err)
     } finally {
@@ -271,7 +291,23 @@ export function createConsolidator({ db, ai }: { db: Db; ai: AiClient }): Consol
     enqueue,
     ungroupArticle,
     status() {
-      return { bufferDepth: buffer.length, processing }
+      let estimatedBehindMs: number | null = null
+
+      if (batchHistory.length > 0) {
+        let totalProcessingMs = 0
+        let totalArticles = 0
+        for (const b of batchHistory) {
+          totalProcessingMs += b.endedAt - b.startedAt
+          totalArticles += b.articleCount
+        }
+
+        if (totalArticles > 0 && totalProcessingMs > 0) {
+          const msPerArticle = totalProcessingMs / totalArticles
+          estimatedBehindMs = Math.round(buffer.length * msPerArticle)
+        }
+      }
+
+      return { bufferDepth: buffer.length, processing, estimatedBehindMs }
     },
     start() {
       timer = setInterval(drain, DRAIN_INTERVAL_MS)

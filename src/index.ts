@@ -11,7 +11,7 @@ async function main() {
   const db = createDb(config.dbPath)
   const ai = createAi(config.ai)
 
-  const consolidator = createConsolidator({ db, ai })
+  const consolidator = createConsolidator({ db, ai, config: config.consolidator })
   const grabber = createGrabber({ feeds: config.feeds, onArticle: consolidator.enqueue })
 
   // Late-bound so the callback can reference server without a circular dependency
@@ -28,7 +28,7 @@ async function main() {
 
   const profiler = createProfiler({ db, ai })
 
-  const server = await createServer({ db, aggregator, consolidator, profiler, config: config.server })
+  const server = await createServer({ db, ai, aggregator, consolidator, profiler, config: config.server })
   notifyFrontPage = server.notifyFrontPageGenerated.bind(server)
 
   await server.listen()

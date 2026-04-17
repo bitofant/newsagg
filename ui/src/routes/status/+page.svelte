@@ -6,7 +6,9 @@
 
   let status = $state<Status | null>(null)
   let error = $state('')
+  let now = $state(Date.now())
   let timer: ReturnType<typeof setInterval> | null = null
+  let clock: ReturnType<typeof setInterval> | null = null
 
   async function refresh() {
     try {
@@ -20,15 +22,17 @@
   onMount(() => {
     refresh()
     timer = setInterval(refresh, REFRESH_MS)
+    clock = setInterval(() => { now = Date.now() }, 1000)
   })
 
   onDestroy(() => {
     if (timer) clearInterval(timer)
+    if (clock) clearInterval(clock)
   })
 
   function formatRelative(ts: number | null): string {
     if (ts == null) return 'never'
-    const diff = Date.now() - ts
+    const diff = now - ts
     if (diff < 0) return 'in the future'
     const s = Math.floor(diff / 1000)
     if (s < 60) return `${s}s ago`
@@ -69,11 +73,35 @@
             {status.consolidator.bufferDepth}
           </span>
         </div>
-        <div class="flex items-baseline justify-between">
+        <div class="flex items-baseline justify-between mb-1">
           <span class="text-sm text-stone-600 dark:text-stone-300">Processing</span>
           <span class="text-sm font-medium {status.consolidator.processing ? 'text-green-600 dark:text-green-400' : 'text-stone-400 dark:text-stone-500'}">
             {status.consolidator.processing ? 'yes' : 'idle'}
           </span>
+        </div>
+        <div class="flex items-baseline justify-between">
+          <span class="text-sm text-stone-600 dark:text-stone-300">Est. behind</span>
+          <span class="font-mono text-sm font-semibold {status.consolidator.estimatedBehindMs != null && status.consolidator.estimatedBehindMs > 30 * 60 * 1000 ? 'text-amber-600 dark:text-amber-400' : ''}">
+            {status.consolidator.estimatedBehindMs != null ? formatDuration(status.consolidator.estimatedBehindMs) : '—'}
+          </span>
+        </div>
+      </div>
+
+      <div class="bg-white dark:bg-stone-900 rounded-xl shadow-sm p-5">
+        <h2 class="text-xs uppercase tracking-wide text-stone-500 dark:text-stone-400 mb-3">LLM ({formatDuration(status.llm.windowMs)})</h2>
+        <div class="flex items-baseline justify-between mb-1">
+          <span class="text-sm text-stone-600 dark:text-stone-300">Busy</span>
+          <span class="font-mono text-2xl font-semibold {status.llm.busyPct > 80 ? 'text-amber-600 dark:text-amber-400' : ''}">
+            {status.llm.busyPct}%
+          </span>
+        </div>
+        <div class="flex items-baseline justify-between mb-1">
+          <span class="text-sm text-stone-600 dark:text-stone-300">Requests</span>
+          <span class="font-mono text-sm font-semibold">{status.llm.reqPerMin}/min</span>
+        </div>
+        <div class="flex items-baseline justify-between">
+          <span class="text-sm text-stone-600 dark:text-stone-300">Throughput</span>
+          <span class="font-mono text-sm font-semibold">{status.llm.tokPerSec} tok/s</span>
         </div>
       </div>
 
@@ -100,6 +128,20 @@
             <div class="text-sm text-stone-600 dark:text-stone-300">Articles</div>
             <div class="font-mono text-2xl font-semibold">{status.db.totalArticles}</div>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="bg-white dark:bg-stone-900 rounded-xl shadow-sm p-5 mb-6">
+      <h2 class="text-xs uppercase tracking-wide text-stone-500 dark:text-stone-400 mb-3">Deployable</h2>
+      <div class="flex gap-8">
+        <div>
+          <div class="text-sm text-stone-600 dark:text-stone-300">Built</div>
+          <div class="font-mono text-2xl font-semibold">{formatRelative(status.builtAt)}</div>
+        </div>
+        <div>
+          <div class="text-sm text-stone-600 dark:text-stone-300">Uptime</div>
+          <div class="font-mono text-2xl font-semibold">{formatDuration(now - status.startedAt)}</div>
         </div>
       </div>
     </div>
