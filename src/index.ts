@@ -9,7 +9,7 @@ import { config } from './config.js'
 
 async function main() {
   const db = createDb(config.dbPath)
-  const ai = createAi(config.ai)
+  const ai = await createAi(config.ai)
 
   const consolidator = createConsolidator({ db, ai, config: config.consolidator })
   const grabber = createGrabber({ feeds: config.feeds, onArticle: consolidator.enqueue })
