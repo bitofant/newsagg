@@ -1,5 +1,5 @@
 import type { Db } from '../db/index.js'
-import type { AiClient } from '../ai/index.js'
+import { getAi } from '../ai/index.js'
 
 const DEBOUNCE_MS = 15 * 60 * 1000 // 15 minutes
 
@@ -8,7 +8,7 @@ export interface Profiler {
   stop(): void
 }
 
-export function createProfiler({ db, ai }: { db: Db; ai: AiClient }): Profiler {
+export function createProfiler({ db }: { db: Db }): Profiler {
   const timers = new Map<number, ReturnType<typeof setTimeout>>()
 
   function onVote(userId: number) {
@@ -43,7 +43,7 @@ export function createProfiler({ db, ai }: { db: Db; ai: AiClient }): Profiler {
       `Use second person ("You"). Be specific about the subject areas, not generic. ` +
       `Keep it under 300 words. Do not include a title heading.`
 
-    const profile = await ai.complete(prompt, {
+    const profile = await getAi().complete(prompt, {
       systemPrompt: 'You are a user preference analyst. Write concise, specific preference profiles based on reading behavior.',
       reasoningEffort: 'high',
     })

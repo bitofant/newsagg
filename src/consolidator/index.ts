@@ -1,4 +1,5 @@
-import type { AiClient } from '../ai/index.js'
+import { getAi, type InferenceProvider } from '../ai/index.js'
+import { MAX_OUTPUT_TOKENS } from '../ai/provider.js'
 import type { ConsolidatorConfig } from '../config.js'
 import type { Db } from '../db/index.js'
 import type { RawArticle } from '../grabber/index.js'
@@ -8,8 +9,6 @@ const TOPIC_PAGE_SIZE = 50
 const ARTICLE_BATCH_SIZE = 10
 const DRAIN_INTERVAL_MS = 5_000
 
-/** Hardcoded max_tokens in src/ai/index.ts — must match. */
-const MAX_OUTPUT_TOKENS = 4096
 /** Slack for tokenization inaccuracy and unexpected prompt expansion. */
 const BUDGET_SAFETY_MARGIN = 256
 /** Minimum input budget: even a tiny context window should fit something. */
@@ -21,7 +20,7 @@ function estimateTokens(s: string): number {
 }
 
 /** Tokens available for dynamic prompt content, given the fixed instruction overhead for a call. */
-function inputBudget(ai: AiClient, fixedOverheadTokens: number): number {
+function inputBudget(ai: InferenceProvider, fixedOverheadTokens: number): number {
   return Math.max(
     MIN_INPUT_BUDGET,
     ai.maxContextTokens - MAX_OUTPUT_TOKENS - fixedOverheadTokens - BUDGET_SAFETY_MARGIN,
@@ -71,7 +70,7 @@ export interface Consolidator {
 
 // IMPLEMENTED: batched topic matching with paginated topics, internal queue, concluded_issue detection
 // PLANNED: embedding-based pre-filter
-export function createConsolidator({ db, ai, config }: { db: Db; ai: AiClient; config: ConsolidatorConfig }): Consolidator {
+export function createConsolidator({ db, config }: { db: Db; config: ConsolidatorConfig }): Consolidator {
   const buffer: RawArticle[] = []
   const pendingUrls = new Set<string>()
   let timer: ReturnType<typeof setInterval> | null = null
@@ -98,8 +97,9 @@ export function createConsolidator({ db, ai, config }: { db: Db; ai: AiClient; c
       const fresh = batch.filter((a) => !db.news.articleExistsByUrl(a.url))
       if (fresh.length === 0) return
 
+      const ai = getAi()
       const startedAt = Date.now()
-      await processBatch(fresh)
+      await processBatch(ai, fresh)
       const endedAt = Date.now()
 
       batchHistory.push({ startedAt, endedAt, articleCount: fresh.length })
@@ -114,7 +114,7 @@ export function createConsolidator({ db, ai, config }: { db: Db; ai: AiClient; c
     }
   }
 
-  async function processBatch(articles: RawArticle[]): Promise<void> {
+  async function processBatch(ai: InferenceProvider, articles: RawArticle[]): Promise<void> {
     const totalTopics = db.news.topicCount()
     let offset = 0
     // Accumulate matched topics per article across all pages
@@ -230,6 +230,7 @@ export function createConsolidator({ db, ai, config }: { db: Db; ai: AiClient; c
     const article = db.news.getArticleById(articleId)
     if (!article) throw new Error(`Article ${articleId} not found`)
 
+    const ai = getAi()
     db.news.unlinkArticleFromTopic(articleId, topicId)
 
     // Re-classify: run paginated matching excluding the old topic
@@ -324,7 +325,7 @@ interface BatchMatchEntry {
 }
 
 async function matchBatchAgainstTopics(
-  ai: AiClient,
+  ai: InferenceProvider,
   articles: RawArticle[],
   topics: Topic[],
 ): Promise<BatchMatchEntry[]> {
@@ -373,7 +374,7 @@ async function matchBatchAgainstTopics(
   return entries
 }
 
-async function generateTopicSummary(ai: AiClient, article: RawArticle): Promise<{ title: string; description: string }> {
+async function generateTopicSummary(ai: InferenceProvider, article: RawArticle): Promise<{ title: string; description: string }> {
   const response = await ai.complete(
     `You are a news editor. Create a topic entry for this new article.
 
@@ -395,7 +396,7 @@ Reply with JSON only: { "title": "short topic title", "description": "one senten
 
 /** Batch-generate topic summaries for multiple unmatched articles in one or more LLM calls */
 async function generateTopicSummaries(
-  ai: AiClient,
+  ai: InferenceProvider,
   articles: RawArticle[],
 ): Promise<{ title: string; description: string }[]> {
   if (articles.length === 0) return []
@@ -448,7 +449,7 @@ async function generateTopicSummaries(
 }
 
 /** Batch-regenerate summaries for multiple topics in one LLM call */
-async function regenerateTopicSummaries(ai: AiClient, db: Db, topicIds: number[]): Promise<void> {
+async function regenerateTopicSummaries(ai: InferenceProvider, db: Db, topicIds: number[]): Promise<void> {
   // Gather context for each topic
   interface TopicContext {
     topicId: number
@@ -554,7 +555,7 @@ async function regenerateTopicSummaries(ai: AiClient, db: Db, topicIds: number[]
 }
 
 /** Single-article assessment (used by ungroupArticle) */
-async function regenerateTopicSummary(ai: AiClient, db: Db, topicId: number): Promise<void> {
+async function regenerateTopicSummary(ai: InferenceProvider, db: Db, topicId: number): Promise<void> {
   return regenerateTopicSummaries(ai, db, [topicId])
 }
 
@@ -572,7 +573,7 @@ interface AssessmentPairInput {
 
 /** Batch-assess multiple article-topic pairs in one LLM call */
 async function assessArticleBatch(
-  ai: AiClient,
+  ai: InferenceProvider,
   pairs: AssessmentPairInput[],
 ): Promise<ArticleAssessment[]> {
   if (pairs.length === 1) {

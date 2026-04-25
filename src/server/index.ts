@@ -8,7 +8,7 @@ import { readFileSync, writeFileSync, existsSync, statSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import type { ServerResponse } from 'http'
 import type { Db } from '../db/index.js'
-import type { AiClient } from '../ai/index.js'
+import { getAi } from '../ai/index.js'
 import type { Aggregator } from '../aggregator/index.js'
 import type { Consolidator } from '../consolidator/index.js'
 import type { Profiler } from '../profiler/index.js'
@@ -35,7 +35,6 @@ function loadJwtSecret(): string {
 
 export interface ServerOptions {
   db: Db
-  ai: AiClient
   aggregator: Aggregator
   consolidator: Consolidator
   profiler: Profiler
@@ -43,7 +42,7 @@ export interface ServerOptions {
 }
 
 // IMPLEMENTED: auth routes, front page API, voting endpoint, user preferences, SSE push for new front pages
-export async function createServer({ db, ai, aggregator, consolidator, profiler, config }: ServerOptions) {
+export async function createServer({ db, aggregator, consolidator, profiler, config }: ServerOptions) {
   const app = Fastify({ logger: true })
 
   // SSE connections: userId -> set of active response streams
@@ -259,7 +258,7 @@ export async function createServer({ db, ai, aggregator, consolidator, profiler,
       timestamp: now,
       startedAt: STARTED_AT,
       builtAt: BUILT_AT,
-      llm: ai.status(),
+      llm: getAi().status(),
       consolidator: consolidator.status(),
       aggregator: aggregator.status(),
       db: { topicCount: db.news.topicCount(), totalArticles: db.news.totalArticleCount() },

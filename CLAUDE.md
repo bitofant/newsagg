@@ -21,9 +21,13 @@ A personal news aggregator that collects articles from RSS feeds, consolidates t
 ### Components
 
 1. **AI** (`src/ai/`) - LLM wrapper (OpenAI-compatible API, targeting Ollama or vLLM)
-   - Config: model name, URL, optional credentials, max context size, status window
-   - `model` and `maxContextTokens` accept `"auto"` to fetch from `/v1/models` at startup (vLLM serves `max_model_len` in the model list; Ollama does not — set them explicitly for Ollama)
+   - Polymorphic via `InferenceProvider` (abstract base in `src/ai/provider.ts`) with `OllamaProvider` and `VllmProvider` subclasses. Production code receives the abstract type via `getAi()` from `src/ai/index.ts`; backend-specific methods (`VllmProvider.fetchModelInfo`, `OllamaProvider.listModels`/`ping`) are intentionally not on the abstract interface so production code cannot depend on them — they are reachable from `llm-test.ts` and tests via `instanceof` narrowing.
+   - Lazy singleton via `Singletons.computeIfAbsent('ai', ...)` (see `src/singletons.ts`). The first `getAi()` call constructs the right provider based on `config.ai.backend`. Tests pre-populate the registry with a mock (`Singletons.set('ai', mock)`) before any production code touches `getAi()`.
+   - Config: `backend: 'ollama' | 'vllm'`, model name, URL, optional credentials, max context size, status window, `requestTimeoutMs` (default 5 min — caps every chat-completion call so a hung backend surfaces fast).
+   - `model` and `maxContextTokens` accept `"auto"` to fetch from `/v1/models` at startup (vLLM serves `max_model_len` in the model list; Ollama does not — `OllamaProvider.doInit()` throws if either is `"auto"`).
+   - Initialization is lazy and one-shot: `InferenceProvider.ensureInitialized()` runs `doInit()` once on the first `complete()` call. Mocks pre-populated in `Singletons` skip init entirely (they override `complete` directly).
    - **Per-call reasoning effort**: `complete(prompt, { reasoningEffort: 'low' | 'medium' | 'high' })` sends `reasoning_effort` in the request body (OpenAI-compatible). Callers pick a level based on whether the task is reasoning-shaped: matching, assessment, relevance scoring, and profile generation pass `'high'`; topic summary generation/regeneration passes `'low'` (mostly extractive, doesn't benefit from reasoning and reasoning tokens slow the consolidator drain). Omit the option to leave it at the backend default. Reasoning tokens are returned in `message.reasoning_content` (vLLM requires `--enable-reasoning --reasoning-parser <name>`; Ollama gpt-oss models populate it natively).
+   - **Per-call timeout**: `complete(prompt, { timeoutMs })` overrides `config.ai.requestTimeoutMs` for one call. `npm run llm-test` uses 30s.
    - **LLM call logging**: every `complete()` call writes 3 files to `llm/{YYYYMMDD}/` (gitignored): `{unix_ts}.req` (request JSON), `{unix_ts}.res` (response text), `{unix_ts}.think` (reasoning tokens text, if present). Fire-and-forget, never blocks inference.
    - **Call metrics**: each `complete()` records `{startedAt, endedAt, promptTokens, completionTokens, reasoningTokens}` in a rolling window (`ai.statusWindowMs`, default 10 min). Surfaced via `status()` as `busyPct`, `reqPerMin`, `tokPerSec`, `reasoningTokPerSec` (non-zero only for reasoning models; sourced from `usage.completion_tokens_details.reasoning_tokens`). `reasoningTokPerSec` is shown on `/status` only when non-zero.
 
@@ -106,7 +110,7 @@ All configuration lives in `config.json` at the project root (override path via 
 ```jsonc
 {
   "feeds": ["https://..."],           // RSS feed URLs
-  "ai": { "url", "model", "maxContextTokens", "apiKey?", "statusWindowMs" },
+  "ai": { "backend", "url", "model", "maxContextTokens", "apiKey?", "statusWindowMs", "requestTimeoutMs" },
   "consolidator": { "statusWindowMs" },   // rolling window for /status busy % + backlog ETA
   "aggregator": { "intervalMs", "workers" },
   "server": { "port", "uiDir" },
@@ -146,12 +150,15 @@ npm start            # run compiled output
 
 # Type check
 npx tsc --noEmit
+
+# Diagnose the LLM backend (sends a hardcoded prompt with a 30s timeout)
+npm run llm-test
 ```
 
 ## Code Style
 
 - TypeScript strict mode, ES modules (`"type": "module"`)
-- Functional factories (`createX()`) rather than classes
+- Functional factories (`createX()`) rather than classes — *exception:* where polymorphism is the natural model (e.g. AI inference providers in `src/ai/`), use an abstract base + subclasses. The `Singletons` container in `src/singletons.ts` (keyed by string, with `computeIfAbsent` / `set` / `clear`) decides which concrete instance is used at runtime, and tests pre-populate it with mocks.
 - Interfaces exported alongside implementations
 - Column mapping from snake_case (SQL) to camelCase (TS) done at the DB layer boundary
 
@@ -208,8 +215,12 @@ A log of non-obvious choices and course corrections. Read these before proposing
 
 20. **Token-budgeted chunking for batched LLM calls** (2026-04-16): Every batched consolidator call (`matchBatchAgainstTopics`, `assessArticleBatch`, `generateTopicSummaries`, `regenerateTopicSummaries`) rejects fixed chunk sizes in favor of a rough token estimate (`~4 chars/token`) against `ai.maxContextTokens - MAX_OUTPUT_TOKENS - overhead - safety_margin`. Items are accumulated greedily until the budget is hit, then the chunk fires and a new one starts. If a chunk ends up with a single item, execution falls through to the function's single-item fast path (simpler prompt, same parse shape). Rationale: hardcoded `TOPIC_PAGE_SIZE = 50` and unbounded per-batch pair counts could silently overflow small-context models (e.g., a local 2K-context setup), causing truncation or empty responses. `maxContextTokens` is now the single knob that controls safe prompt sizing. The estimate is deliberately rough — the failure mode of over-estimating is an extra LLM call, not a rejected request.
 
-21. **vLLM auto-detection via `"auto"` sentinel** (2026-04-25): `config.ai.model` and `config.ai.maxContextTokens` accept `"auto"` to fetch the first model's `id` and `max_model_len` from `GET /v1/models` at startup. `createAi()` is async and resolves these before returning the client. One fetch covers both fields. vLLM always includes `max_model_len` in its model list; Ollama does not — setting `"auto"` with Ollama will throw a clear startup error. The `maxContextTokens` property on `AiClient` is always a resolved `number`. Rationale: vLLM typically serves a single model and the context window is a property of the model weights, not something operators should have to look up manually.
+21. **vLLM auto-detection via `"auto"` sentinel** (2026-04-25): `config.ai.model` and `config.ai.maxContextTokens` accept `"auto"` to fetch the first model's `id` and `max_model_len` from `GET /v1/models` at startup. `VllmProvider.doInit()` resolves these before the first `complete()` call. One fetch covers both fields. vLLM always includes `max_model_len` in its model list; Ollama does not — setting `"auto"` with Ollama backend throws a clear error. The `maxContextTokens` property on `InferenceProvider` is always a resolved `number` after init. Rationale: vLLM typically serves a single model and the context window is a property of the model weights, not something operators should have to look up manually.
 
-22. **Reasoning effort is per-call, not config** (2026-04-25): `AiClient.complete(prompt, { reasoningEffort })` accepts `'low' | 'medium' | 'high'` and sends it as `reasoning_effort` in the request body (OpenAI-compatible — works on Ollama gpt-oss models and vLLM with a reasoning parser). Every caller currently passes `'high'`, but the design is per-call so different pipeline stages (matching vs. summarization vs. relevance scoring) can dial it down later. The previous config-level `thinkingEffort` field was removed because it never made it into a request body; the per-call parameter replaces it. Rationale: a global config value would force all stages to the same effort level, but matching against 50 topics has different latency tolerances than scoring 100 sections for relevance.
+22. **Reasoning effort is per-call, not config** (2026-04-25): `InferenceProvider.complete(prompt, { reasoningEffort })` accepts `'low' | 'medium' | 'high'` and sends it as `reasoning_effort` in the request body (OpenAI-compatible — works on Ollama gpt-oss models and vLLM with a reasoning parser). Matching, assessment, relevance scoring, and profile generation pass `'high'`; topic summary generation/regeneration passes `'low'`. The previous config-level `thinkingEffort` field was removed because it never made it into a request body; the per-call parameter replaces it. Rationale: a global config value would force all stages to the same effort level, but matching against 50 topics has different latency tolerances than scoring 100 sections for relevance.
 
 23. **Status endpoint over CLI script, no auth** (2026-04-16): Pipeline health (is processing behind?) is exposed via `GET /api/status` and a `/status` UI page, not a `npm run check` CLI script. Rationale: the most useful signals — consolidator `buffer.length`, aggregator `queue.length` and `activeWorkers` — are in-memory state inside the running process, not queryable from SQLite. A standalone script would only see the DB side (topic/article counts, last front-page times). The endpoint is unauthenticated because a) this is a personal/hobby deployment, b) it exposes no user-generated content, only counters and email addresses that the user already controls, and c) it needs to be trivially curl-able. If the project ever becomes multi-tenant, gate the endpoint and stop emitting emails.
+
+24. **AI module: classes + Singletons container** (2026-04-25): The AI module is the one place where `createX()` factories are replaced with classes — abstract `InferenceProvider` (in `src/ai/provider.ts`) with `OllamaProvider` and `VllmProvider` subclasses. Backend-specific public methods (`fetchModelInfo`, `listModels`, `ping`) are reachable only via `instanceof` narrowing; production code holds the abstract type. A generic `Singletons` registry (`src/singletons.ts`, `computeIfAbsent` / `set` / `clear`, keyed by string) lazily constructs the configured provider on first `getAi()` call; tests pre-populate it with mocks. Other modules keep their `createX()` factories — this scope is AI-only for now. Rationale: backends share an OpenAI-compatible request body but differ in initialization and diagnostic surface; polymorphism captures that cleanly, and the registry gives a uniform test-override hook.
+
+25. **Per-request timeout in `complete()`** (2026-04-25): Every chat-completion call uses `AbortController` with `config.ai.requestTimeoutMs` (default 5 min, overridable via `opts.timeoutMs`). Previously `fetch` had no timeout — a hung backend could pin the consolidator drain silently.
