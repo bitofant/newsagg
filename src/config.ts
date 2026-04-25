@@ -12,9 +12,11 @@ export interface Config {
 
 export interface AiConfig {
   url: string
+  /** Model name, or "auto" to fetch the first model from /v1/models (vLLM) */
   model: string
   thinkingEffort: 'low' | 'medium' | 'high'
-  maxContextTokens: number
+  /** Context window size in tokens, or "auto" to fetch max_model_len from /v1/models (vLLM) */
+  maxContextTokens: number | 'auto'
   apiKey?: string
   /** Rolling window (ms) for LLM call metrics on /status. Default: 10 minutes. */
   statusWindowMs: number

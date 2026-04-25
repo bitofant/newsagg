@@ -4,6 +4,7 @@
     "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"
   ],
   "ai": {
+    "_comment": "For vLLM: set model and maxContextTokens to \"auto\" to fetch from /v1/models at startup",
     "url": "http://localhost:11434/v1",
     "model": "gemma3:27b",
     "thinkingEffort": "medium",

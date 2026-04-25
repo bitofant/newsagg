@@ -99,10 +99,16 @@
           <span class="text-sm text-stone-600 dark:text-stone-300">Requests</span>
           <span class="font-mono text-sm font-semibold">{status.llm.reqPerMin}/min</span>
         </div>
-        <div class="flex items-baseline justify-between">
+        <div class="flex items-baseline justify-between {status.llm.reasoningTokPerSec > 0 ? 'mb-1' : ''}">
           <span class="text-sm text-stone-600 dark:text-stone-300">Throughput</span>
           <span class="font-mono text-sm font-semibold">{status.llm.tokPerSec} tok/s</span>
         </div>
+        {#if status.llm.reasoningTokPerSec > 0}
+        <div class="flex items-baseline justify-between">
+          <span class="text-sm text-stone-600 dark:text-stone-300">Thinking</span>
+          <span class="font-mono text-sm font-semibold">{status.llm.reasoningTokPerSec} think tok/s</span>
+        </div>
+        {/if}
       </div>
 
       <div class="bg-white dark:bg-stone-900 rounded-xl shadow-sm p-5">

@@ -118,7 +118,7 @@ export interface Status {
   timestamp: number
   startedAt: number
   builtAt: number
-  llm: { busyPct: number; reqPerMin: number; tokPerSec: number; windowMs: number }
+  llm: { busyPct: number; reqPerMin: number; tokPerSec: number; reasoningTokPerSec: number; windowMs: number }
   consolidator: { bufferDepth: number; processing: boolean; estimatedBehindMs: number | null }
   aggregator: { queueLength: number; activeWorkers: number }
   db: { topicCount: number; totalArticles: number }
