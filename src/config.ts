@@ -14,7 +14,6 @@ export interface AiConfig {
   url: string
   /** Model name, or "auto" to fetch the first model from /v1/models (vLLM) */
   model: string
-  thinkingEffort: 'low' | 'medium' | 'high'
   /** Context window size in tokens, or "auto" to fetch max_model_len from /v1/models (vLLM) */
   maxContextTokens: number | 'auto'
   apiKey?: string
@@ -56,7 +55,6 @@ function loadConfig(): Config {
     ai: {
       url: raw.ai?.url ?? 'http://localhost:11434/v1',
       model: raw.ai?.model ?? 'llama3.2',
-      thinkingEffort: raw.ai?.thinkingEffort ?? 'medium',
       maxContextTokens: raw.ai?.maxContextTokens ?? 8192,
       apiKey: raw.ai?.apiKey,
       statusWindowMs: raw.ai?.statusWindowMs ?? 10 * 60 * 1000,

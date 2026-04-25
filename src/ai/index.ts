@@ -2,8 +2,14 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { AiConfig } from '../config.js'
 
+export interface CompleteOptions {
+  systemPrompt?: string
+  /** Reasoning effort. Sent as `reasoning_effort` (OpenAI-compatible). Omit to leave at backend default. */
+  reasoningEffort?: 'low' | 'medium' | 'high'
+}
+
 export interface AiClient {
-  complete(prompt: string, systemPrompt?: string): Promise<string>
+  complete(prompt: string, opts?: CompleteOptions): Promise<string>
   /** Configured max input context tokens. Callers use this to size batched prompts. */
   readonly maxContextTokens: number
   /** Rolling-window metrics for /status. busyPct can exceed 100% if calls overlap. */
@@ -96,26 +102,30 @@ export async function createAi(config: AiConfig): Promise<AiClient> {
     }
   }
 
-  async function complete(prompt: string, systemPrompt?: string): Promise<string> {
+  async function complete(prompt: string, opts?: CompleteOptions): Promise<string> {
     const messages: { role: string; content: string }[] = []
 
-    if (systemPrompt) {
-      messages.push({ role: 'system', content: systemPrompt })
+    if (opts?.systemPrompt) {
+      messages.push({ role: 'system', content: opts.systemPrompt })
     }
     messages.push({ role: 'user', content: prompt })
 
     const timestamp = Math.floor(Date.now() / 1000)
     const startedAt = Date.now()
 
+    const body: Record<string, unknown> = {
+      model: resolvedModel,
+      messages,
+      max_tokens: 4096,
+    }
+    if (opts?.reasoningEffort) {
+      body['reasoning_effort'] = opts.reasoningEffort
+    }
+
     const response = await fetch(`${config.url}/chat/completions`, {
       method: 'POST',
       headers,
-      body: JSON.stringify({
-        model: resolvedModel,
-        messages,
-        max_tokens: 4096,
-        // thinking_effort: config.thinkingEffort, // enable when model supports it
-      }),
+      body: JSON.stringify(body),
     })
 
     if (!response.ok) {

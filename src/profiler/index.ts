@@ -43,10 +43,10 @@ export function createProfiler({ db, ai }: { db: Db; ai: AiClient }): Profiler {
       `Use second person ("You"). Be specific about the subject areas, not generic. ` +
       `Keep it under 300 words. Do not include a title heading.`
 
-    const profile = await ai.complete(
-      prompt,
-      'You are a user preference analyst. Write concise, specific preference profiles based on reading behavior.',
-    )
+    const profile = await ai.complete(prompt, {
+      systemPrompt: 'You are a user preference analyst. Write concise, specific preference profiles based on reading behavior.',
+      reasoningEffort: 'high',
+    })
 
     db.users.updatePreferenceProfile(userId, profile.trim())
     console.log(`[profiler] generated preference profile for user ${userId}`)
