@@ -346,7 +346,7 @@ async function matchBatchAgainstTopics(
 
   for (const chunk of chunks) {
     const topicList = chunk.map((t) => `${t.id}: ${t.title} — ${t.description}`).join('\n')
-    const response = await ai.complete(instructionsPrefix + topicList + instructionsSuffix)
+    const response = await ai.complete(instructionsPrefix + topicList + instructionsSuffix, { reasoningEffort: 'high' })
 
     try {
       const results = JSON.parse(stripCodeFences(response)) as { article: number; topicIds: number[] }[]
@@ -382,6 +382,7 @@ Title: ${article.title}
 Text: ${article.text.slice(0, 500)}
 
 Reply with JSON only: { "title": "short topic title", "description": "one sentence terse description" }`,
+    { reasoningEffort: 'low' },
   )
 
   try {
@@ -428,7 +429,7 @@ async function generateTopicSummaries(
       .map((originalIndex, localIndex) => `${localIndex}: "${articles[originalIndex].title}" — ${articles[originalIndex].text.slice(0, 300)}`)
       .join('\n\n')
 
-    const response = await ai.complete(instructionsPrefix + articleList + instructionsSuffix)
+    const response = await ai.complete(instructionsPrefix + articleList + instructionsSuffix, { reasoningEffort: 'low' })
 
     try {
       const parsed = JSON.parse(stripCodeFences(response)) as { index: number; title: string; description: string }[]
@@ -480,6 +481,7 @@ async function regenerateTopicSummaries(ai: AiClient, db: Db, topicIds: number[]
           `Background: ${ctx.topic.description}\n\n` +
           `Recent articles:\n${ctx.articleContext}\n\n` +
           `Reply with ONLY the summary text, no JSON, no formatting.`,
+        { reasoningEffort: 'low' },
       )
       const summary = response.trim()
       if (summary) {
@@ -514,6 +516,7 @@ async function regenerateTopicSummaries(ai: AiClient, db: Db, topicIds: number[]
             `Background: ${ctx.topic.description}\n\n` +
             `Recent articles:\n${ctx.articleContext}\n\n` +
             `Reply with ONLY the summary text, no JSON, no formatting.`,
+          { reasoningEffort: 'low' },
         )
         const summary = response.trim()
         if (summary) {
@@ -533,7 +536,7 @@ async function regenerateTopicSummaries(ai: AiClient, db: Db, topicIds: number[]
       .join('\n\n---\n\n')
 
     try {
-      const response = await ai.complete(instructionsPrefix + topicList + instructionsSuffix)
+      const response = await ai.complete(instructionsPrefix + topicList + instructionsSuffix, { reasoningEffort: 'low' })
 
       const parsed = JSON.parse(stripCodeFences(response)) as { topicId: number; summary: string }[]
       for (const entry of parsed) {
@@ -597,6 +600,7 @@ Determine:
 2. "isConcluded": Does this article indicate the issue/story has reached a conclusion or resolution (e.g., final verdict, deal closed, crisis resolved, investigation completed)?
 
 Reply with ONLY JSON: {"isSubstantial": true/false, "isConcluded": true/false}`,
+      { reasoningEffort: 'high' },
     )
 
     try {
@@ -641,7 +645,7 @@ Reply with ONLY JSON: {"isSubstantial": true/false, "isConcluded": true/false}`,
       .map((originalIndex, localIndex) => renderPair(pairs[originalIndex], localIndex))
       .join('\n\n')
 
-    const response = await ai.complete(instructionsPrefix + pairList + instructionsSuffix)
+    const response = await ai.complete(instructionsPrefix + pairList + instructionsSuffix, { reasoningEffort: 'high' })
 
     try {
       const parsed = JSON.parse(stripCodeFences(response)) as { index: number; isSubstantial: boolean; isConcluded: boolean }[]

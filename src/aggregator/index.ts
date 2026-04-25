@@ -199,7 +199,7 @@ export function createAggregator({
           `Reply with ONLY a JSON array of numbers, one per topic in order. Example: [3, 5, 1, 4, ...]\n` +
           `Do not wrap in markdown code fences.`
 
-        const raw = await ai.complete(prompt, 'You are a news relevance scorer.')
+        const raw = await ai.complete(prompt, { systemPrompt: 'You are a news relevance scorer.', reasoningEffort: 'high' })
         const scores = JSON.parse(stripCodeFences(raw)) as number[]
         if (Array.isArray(scores) && scores.length === sectionsWithRelevance.length) {
           for (let i = 0; i < scores.length; i++) {

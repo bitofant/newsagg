@@ -21,8 +21,9 @@ A personal news aggregator that collects articles from RSS feeds, consolidates t
 ### Components
 
 1. **AI** (`src/ai/`) - LLM wrapper (OpenAI-compatible API, targeting Ollama or vLLM)
-   - Config: model name, thinking effort, URL, optional credentials, max context size, status window
+   - Config: model name, URL, optional credentials, max context size, status window
    - `model` and `maxContextTokens` accept `"auto"` to fetch from `/v1/models` at startup (vLLM serves `max_model_len` in the model list; Ollama does not — set them explicitly for Ollama)
+   - **Per-call reasoning effort**: `complete(prompt, { reasoningEffort: 'low' | 'medium' | 'high' })` sends `reasoning_effort` in the request body (OpenAI-compatible). Callers pick a level based on whether the task is reasoning-shaped: matching, assessment, relevance scoring, and profile generation pass `'high'`; topic summary generation/regeneration passes `'low'` (mostly extractive, doesn't benefit from reasoning and reasoning tokens slow the consolidator drain). Omit the option to leave it at the backend default. Reasoning tokens are returned in `message.reasoning_content` (vLLM requires `--enable-reasoning --reasoning-parser <name>`; Ollama gpt-oss models populate it natively).
    - **LLM call logging**: every `complete()` call writes 3 files to `llm/{YYYYMMDD}/` (gitignored): `{unix_ts}.req` (request JSON), `{unix_ts}.res` (response text), `{unix_ts}.think` (reasoning tokens text, if present). Fire-and-forget, never blocks inference.
    - **Call metrics**: each `complete()` records `{startedAt, endedAt, promptTokens, completionTokens, reasoningTokens}` in a rolling window (`ai.statusWindowMs`, default 10 min). Surfaced via `status()` as `busyPct`, `reqPerMin`, `tokPerSec`, `reasoningTokPerSec` (non-zero only for reasoning models; sourced from `usage.completion_tokens_details.reasoning_tokens`). `reasoningTokPerSec` is shown on `/status` only when non-zero.
 
@@ -105,7 +106,7 @@ All configuration lives in `config.json` at the project root (override path via 
 ```jsonc
 {
   "feeds": ["https://..."],           // RSS feed URLs
-  "ai": { "url", "model", "thinkingEffort", "maxContextTokens", "apiKey?", "statusWindowMs" },
+  "ai": { "url", "model", "maxContextTokens", "apiKey?", "statusWindowMs" },
   "consolidator": { "statusWindowMs" },   // rolling window for /status busy % + backlog ETA
   "aggregator": { "intervalMs", "workers" },
   "server": { "port", "uiDir" },
@@ -162,7 +163,6 @@ Items tracked in code with `// PLANNED` markers:
 - ~~**Aggregator punt logic**~~ → **IMPLEMENTED** (`src/aggregator/index.ts`) — tick is skipped entirely when all workers are saturated; per-user queue depth cap (`workers * 2`) prevents queue bloat within a tick
 - ~~**User preferences expansion**~~ → **IMPLEMENTED** — `interval_ms` + `preference_profile` (LLM-generated markdown) exposed via `GET/PATCH /api/preferences` and `/settings` UI; profile auto-generated from votes via profiler, hand-editable in settings
 - ~~**WebSocket push**~~ → **IMPLEMENTED as SSE push** (`src/server/index.ts`) — `GET /api/events?token=<jwt>` sends `frontpage` events when a new front page is generated; UI auto-refreshes via `EventSource` with exponential backoff reconnect
-- **`thinking_effort` / `enable_thinking` parameter** (`src/ai/index.ts`) — commented out; Ollama and vLLM use different parameter names for activating reasoning mode, and support is model-specific
 
 ## Deliberate Decisions
 
@@ -210,4 +210,6 @@ A log of non-obvious choices and course corrections. Read these before proposing
 
 21. **vLLM auto-detection via `"auto"` sentinel** (2026-04-25): `config.ai.model` and `config.ai.maxContextTokens` accept `"auto"` to fetch the first model's `id` and `max_model_len` from `GET /v1/models` at startup. `createAi()` is async and resolves these before returning the client. One fetch covers both fields. vLLM always includes `max_model_len` in its model list; Ollama does not — setting `"auto"` with Ollama will throw a clear startup error. The `maxContextTokens` property on `AiClient` is always a resolved `number`. Rationale: vLLM typically serves a single model and the context window is a property of the model weights, not something operators should have to look up manually.
 
-22. **Status endpoint over CLI script, no auth** (2026-04-16): Pipeline health (is processing behind?) is exposed via `GET /api/status` and a `/status` UI page, not a `npm run check` CLI script. Rationale: the most useful signals — consolidator `buffer.length`, aggregator `queue.length` and `activeWorkers` — are in-memory state inside the running process, not queryable from SQLite. A standalone script would only see the DB side (topic/article counts, last front-page times). The endpoint is unauthenticated because a) this is a personal/hobby deployment, b) it exposes no user-generated content, only counters and email addresses that the user already controls, and c) it needs to be trivially curl-able. If the project ever becomes multi-tenant, gate the endpoint and stop emitting emails.
+22. **Reasoning effort is per-call, not config** (2026-04-25): `AiClient.complete(prompt, { reasoningEffort })` accepts `'low' | 'medium' | 'high'` and sends it as `reasoning_effort` in the request body (OpenAI-compatible — works on Ollama gpt-oss models and vLLM with a reasoning parser). Every caller currently passes `'high'`, but the design is per-call so different pipeline stages (matching vs. summarization vs. relevance scoring) can dial it down later. The previous config-level `thinkingEffort` field was removed because it never made it into a request body; the per-call parameter replaces it. Rationale: a global config value would force all stages to the same effort level, but matching against 50 topics has different latency tolerances than scoring 100 sections for relevance.
+
+23. **Status endpoint over CLI script, no auth** (2026-04-16): Pipeline health (is processing behind?) is exposed via `GET /api/status` and a `/status` UI page, not a `npm run check` CLI script. Rationale: the most useful signals — consolidator `buffer.length`, aggregator `queue.length` and `activeWorkers` — are in-memory state inside the running process, not queryable from SQLite. A standalone script would only see the DB side (topic/article counts, last front-page times). The endpoint is unauthenticated because a) this is a personal/hobby deployment, b) it exposes no user-generated content, only counters and email addresses that the user already controls, and c) it needs to be trivially curl-able. If the project ever becomes multi-tenant, gate the endpoint and stop emitting emails.
