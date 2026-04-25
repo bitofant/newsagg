@@ -1,4 +1,4 @@
-import type { AiClient } from '../ai/index.js'
+import { getAi } from '../ai/index.js'
 import type { Db } from '../db/index.js'
 import type { AggregatorConfig } from '../config.js'
 import type { Signal } from '../db/users.js'
@@ -41,12 +41,10 @@ const MAX_SUMMARY_CHARS = 300
 //              preference-profile-based relevance ranking, punt logic when overloaded
 export function createAggregator({
   db,
-  ai,
   config,
   onFrontPageGenerated,
 }: {
   db: Db
-  ai: AiClient
   config: AggregatorConfig
   onFrontPageGenerated?: (userId: number, generatedAt: number) => void
 }): Aggregator {
@@ -199,7 +197,7 @@ export function createAggregator({
           `Reply with ONLY a JSON array of numbers, one per topic in order. Example: [3, 5, 1, 4, ...]\n` +
           `Do not wrap in markdown code fences.`
 
-        const raw = await ai.complete(prompt, { systemPrompt: 'You are a news relevance scorer.', reasoningEffort: 'high' })
+        const raw = await getAi().complete(prompt, { systemPrompt: 'You are a news relevance scorer.', reasoningEffort: 'high' })
         const scores = JSON.parse(stripCodeFences(raw)) as number[]
         if (Array.isArray(scores) && scores.length === sectionsWithRelevance.length) {
           for (let i = 0; i < scores.length; i++) {

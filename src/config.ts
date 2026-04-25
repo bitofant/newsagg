@@ -11,14 +11,18 @@ export interface Config {
 }
 
 export interface AiConfig {
+  /** Inference backend; selects which provider class is instantiated. */
+  backend: 'ollama' | 'vllm'
   url: string
-  /** Model name, or "auto" to fetch the first model from /v1/models (vLLM) */
+  /** Model name, or "auto" to fetch the first model from /v1/models (vLLM only). */
   model: string
-  /** Context window size in tokens, or "auto" to fetch max_model_len from /v1/models (vLLM) */
+  /** Context window size in tokens, or "auto" to fetch max_model_len from /v1/models (vLLM only). */
   maxContextTokens: number | 'auto'
   apiKey?: string
   /** Rolling window (ms) for LLM call metrics on /status. Default: 10 minutes. */
   statusWindowMs: number
+  /** Per-request HTTP timeout in ms. Default: 5 minutes. */
+  requestTimeoutMs: number
 }
 
 export interface ConsolidatorConfig {
@@ -53,11 +57,13 @@ function loadConfig(): Config {
   return {
     dbPath: raw.dbPath ?? './newsagg.db',
     ai: {
+      backend: raw.ai?.backend ?? 'ollama',
       url: raw.ai?.url ?? 'http://localhost:11434/v1',
       model: raw.ai?.model ?? 'llama3.2',
       maxContextTokens: raw.ai?.maxContextTokens ?? 8192,
       apiKey: raw.ai?.apiKey,
       statusWindowMs: raw.ai?.statusWindowMs ?? 10 * 60 * 1000,
+      requestTimeoutMs: raw.ai?.requestTimeoutMs ?? 5 * 60 * 1000,
     },
     feeds: raw.feeds ?? [],
     consolidator: {

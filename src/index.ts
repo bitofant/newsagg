@@ -1,5 +1,4 @@
 import { createDb } from './db/index.js'
-import { createAi } from './ai/index.js'
 import { createGrabber } from './grabber/index.js'
 import { createConsolidator } from './consolidator/index.js'
 import { createAggregator } from './aggregator/index.js'
@@ -9,9 +8,8 @@ import { config } from './config.js'
 
 async function main() {
   const db = createDb(config.dbPath)
-  const ai = await createAi(config.ai)
 
-  const consolidator = createConsolidator({ db, ai, config: config.consolidator })
+  const consolidator = createConsolidator({ db, config: config.consolidator })
   const grabber = createGrabber({ feeds: config.feeds, onArticle: consolidator.enqueue })
 
   // Late-bound so the callback can reference server without a circular dependency
@@ -19,16 +17,15 @@ async function main() {
 
   const aggregator = createAggregator({
     db,
-    ai,
     config: config.aggregator,
     onFrontPageGenerated: (userId, generatedAt) => {
       notifyFrontPage?.(userId, generatedAt)
     },
   })
 
-  const profiler = createProfiler({ db, ai })
+  const profiler = createProfiler({ db })
 
-  const server = await createServer({ db, ai, aggregator, consolidator, profiler, config: config.server })
+  const server = await createServer({ db, aggregator, consolidator, profiler, config: config.server })
   notifyFrontPage = server.notifyFrontPageGenerated.bind(server)
 
   await server.listen()
