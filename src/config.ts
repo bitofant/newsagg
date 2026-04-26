@@ -5,9 +5,17 @@ export interface Config {
   dbPath: string
   ai: AiConfig
   feeds: string[]
+  rssPollInterval: RssPollIntervalConfig
   consolidator: ConsolidatorConfig
   aggregator: AggregatorConfig
   server: ServerConfig
+}
+
+export interface RssPollIntervalConfig {
+  /** Poll interval (ms) used when no override matches a feed URL. */
+  defaultMs: number
+  /** Per-feed overrides; the first entry whose pattern is a case-insensitive substring of the feed URL wins. */
+  overrides: Array<{ pattern: string; intervalMs: number }>
 }
 
 export interface AiConfig {
@@ -45,6 +53,29 @@ export interface ServerConfig {
   registrationEnabled: boolean
 }
 
+function parseDuration(s: string): number {
+  const m = s.trim().match(/^(\d+)\s*(ms|s|m|h)$/)
+  if (!m) throw new Error(`Invalid duration "${s}" — expected e.g. "500ms", "30s", "10m", "2h"`)
+  const n = parseInt(m[1]!, 10)
+  switch (m[2]) {
+    case 'ms': return n
+    case 's': return n * 1000
+    case 'm': return n * 60 * 1000
+    case 'h': return n * 60 * 60 * 1000
+  }
+  throw new Error('unreachable')
+}
+
+function loadRssPollInterval(raw: any): RssPollIntervalConfig {
+  const defaultMs = raw?.default ? parseDuration(raw.default) : 5 * 60 * 1000
+  const rawOverrides = raw?.overrides ?? {}
+  const overrides = Object.entries(rawOverrides).map(([pattern, value]) => {
+    if (typeof value !== 'string') throw new Error(`rssPollInterval.overrides[${pattern}] must be a duration string`)
+    return { pattern: pattern.toLowerCase(), intervalMs: parseDuration(value) }
+  })
+  return { defaultMs, overrides }
+}
+
 function loadConfig(): Config {
   const configPath = resolve(process.env['CONFIG_PATH'] ?? './config.json')
   if (!existsSync(configPath)) {
@@ -66,6 +97,7 @@ function loadConfig(): Config {
       requestTimeoutMs: raw.ai?.requestTimeoutMs ?? 5 * 60 * 1000,
     },
     feeds: raw.feeds ?? [],
+    rssPollInterval: loadRssPollInterval(raw.rssPollInterval),
     consolidator: {
       statusWindowMs: raw.consolidator?.statusWindowMs ?? 10 * 60 * 1000,
     },

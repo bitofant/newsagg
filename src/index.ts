@@ -10,7 +10,7 @@ async function main() {
   const db = createDb(config.dbPath)
 
   const consolidator = createConsolidator({ db, config: config.consolidator })
-  const grabber = createGrabber({ feeds: config.feeds, onArticle: consolidator.enqueue })
+  const grabber = createGrabber({ feeds: config.feeds, pollInterval: config.rssPollInterval, onArticle: consolidator.enqueue })
 
   // Late-bound so the callback can reference server without a circular dependency
   let notifyFrontPage: ((userId: number, generatedAt: number) => void) | undefined

@@ -46,6 +46,7 @@ A personal news aggregator that collects articles from RSS feeds, consolidates t
 
 4. **News Grabber** (`src/grabber/`) - RSS feed follower
    - Monitors configured RSS feeds via `rss-parser`
+   - Per-feed poll interval: `config.rssPollInterval.default` with per-feed `overrides` matched as case-insensitive substrings of the feed URL (first match wins). Each feed gets its own `setInterval` and is polled once on `start()`.
    - Pushes articles to consolidator queue (sync, non-blocking)
    - No dedup — that's the consolidator's job via DB
 
@@ -111,6 +112,7 @@ All configuration lives in `config.json` at the project root (override path via 
 ```jsonc
 {
   "feeds": ["https://..."],           // RSS feed URLs
+  "rssPollInterval": { "default": "10m", "overrides": { "<substring of feed URL>": "<duration>" } },  // duration units: ms/s/m/h
   "ai": { "backend", "url", "model", "maxContextTokens", "apiKey?", "statusWindowMs", "requestTimeoutMs" },
   "consolidator": { "statusWindowMs" },   // rolling window for /status busy % + backlog ETA
   "aggregator": { "intervalMs", "workers" },
