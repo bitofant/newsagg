@@ -4,10 +4,18 @@ import type { AiConfig } from '../config.js'
 
 export interface CompleteOptions {
   systemPrompt?: string
-  /** Reasoning effort. Sent as `reasoning_effort` (OpenAI-compatible). Omit to leave at backend default. */
-  reasoningEffort?: 'low' | 'medium' | 'high'
+  /**
+   * Reasoning effort.
+   * - `'low' | 'medium' | 'high'`: sent as OpenAI-compatible `reasoning_effort`.
+   * - `'off'`: sends `chat_template_kwargs: { enable_thinking: false }` (vLLM extension; the
+   *   chat template — Qwen3's default or our custom one — disables the `<think>` block).
+   * Omit to leave at the backend default.
+   */
+  reasoningEffort?: 'off' | 'low' | 'medium' | 'high'
   /** Per-call request timeout in ms. Falls back to `config.ai.requestTimeoutMs`. */
   timeoutMs?: number
+  /** Diagnostic: when true, dumps the full raw chat-completion JSON response to console.log. Used by llm-test. */
+  verbose?: boolean
 }
 
 export interface ProviderStatus {
@@ -24,7 +32,15 @@ interface ChatMessage {
 }
 
 interface ChatCompletionResponse {
-  choices: { message: { content: string; reasoning_content?: string } }[]
+  choices: {
+    message: {
+      content: string
+      // vLLM reasoning parsers vary on field name: deepseek_r1 emits `reasoning_content`,
+      // qwen3 (and some others) emit `reasoning`. Accept either.
+      reasoning_content?: string
+      reasoning?: string
+    }
+  }[]
   usage?: {
     prompt_tokens?: number
     completion_tokens?: number
@@ -95,7 +111,11 @@ export abstract class InferenceProvider {
       messages,
       max_tokens: MAX_OUTPUT_TOKENS,
     }
-    if (opts?.reasoningEffort) body['reasoning_effort'] = opts.reasoningEffort
+    if (opts?.reasoningEffort === 'off') {
+      body['chat_template_kwargs'] = { enable_thinking: false }
+    } else if (opts?.reasoningEffort) {
+      body['reasoning_effort'] = opts.reasoningEffort
+    }
 
     const timestamp = Math.floor(Date.now() / 1000)
     const startedAt = Date.now()
@@ -104,17 +124,33 @@ export abstract class InferenceProvider {
     const data = await this.fetchChatCompletion(body, timeoutMs)
     const endedAt = Date.now()
 
+    if (opts?.verbose) {
+      console.log('[ai] raw chat-completion response:')
+      console.log(JSON.stringify(data, null, 2))
+    }
+
+    const msg = data.choices[0]!.message
+    const reasoning = msg.reasoning_content ?? msg.reasoning
+    // vLLM with the qwen3 parser does NOT break out reasoning_tokens in usage — it lumps them
+    // into completion_tokens. Estimate from reasoning text length (~4 chars/token) as a fallback
+    // so the rolling-window metric reflects reality on those backends.
+    const reportedReasoningTokens = data.usage?.completion_tokens_details?.reasoning_tokens ?? 0
+    const reasoningTokens = reportedReasoningTokens > 0
+      ? reportedReasoningTokens
+      : reasoning
+        ? Math.ceil(reasoning.length / 4)
+        : 0
+
     this.callHistory.push({
       startedAt,
       endedAt,
       promptTokens: data.usage?.prompt_tokens ?? 0,
       completionTokens: data.usage?.completion_tokens ?? 0,
-      reasoningTokens: data.usage?.completion_tokens_details?.reasoning_tokens ?? 0,
+      reasoningTokens,
     })
     this.pruneHistory(endedAt)
 
-    const msg = data.choices[0]!.message
-    logLlmCall(timestamp, { model: this.resolvedModel, messages }, msg.content, msg.reasoning_content)
+    logLlmCall(timestamp, { model: this.resolvedModel, messages }, msg.content, reasoning)
     return msg.content
   }
 
