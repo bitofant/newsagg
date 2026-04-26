@@ -3,6 +3,13 @@
     "https://feeds.bbci.co.uk/news/rss.xml",
     "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"
   ],
+  "rssPollInterval": {
+    "_comment": "Default poll interval for all feeds, with optional per-feed overrides. Pattern is a case-insensitive substring of the feed URL; first match wins. Units: ms, s, m, h.",
+    "default": "10m",
+    "overrides": {
+      "nytimes.com": "15m"
+    }
+  },
   "ai": {
     "_comment": "backend: 'ollama' or 'vllm'. For vLLM: set model and maxContextTokens to \"auto\" to fetch from /v1/models at startup. requestTimeoutMs caps every chat-completion call.",
     "backend": "ollama",
