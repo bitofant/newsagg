@@ -58,6 +58,9 @@ interface CallRecord {
 
 const LLM_LOG_DIR = './llm'
 
+/** Per-process monotonic counter so concurrent calls in the same second get unique filenames. */
+let logCallSeq = 0
+
 /** Hard cap on output tokens per chat-completion request. Exported so the consolidator can size prompts against it. */
 export const MAX_OUTPUT_TOKENS = 4096
 
@@ -118,6 +121,7 @@ export abstract class InferenceProvider {
     }
 
     const timestamp = Math.floor(Date.now() / 1000)
+    const seq = logCallSeq++
     const startedAt = Date.now()
     const timeoutMs = opts?.timeoutMs ?? this.config.requestTimeoutMs
 
@@ -150,7 +154,7 @@ export abstract class InferenceProvider {
     })
     this.pruneHistory(endedAt)
 
-    logLlmCall(timestamp, { model: this.resolvedModel, messages }, msg.content, reasoning)
+    logLlmCall(timestamp, seq, { model: this.resolvedModel, messages }, msg.content, reasoning)
     return msg.content
   }
 
@@ -209,6 +213,7 @@ export async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs
 
 function logLlmCall(
   timestamp: number,
+  seq: number,
   req: { model: string; messages: ChatMessage[] },
   content: string,
   reasoning?: string,
@@ -216,7 +221,7 @@ function logLlmCall(
   const date = new Date(timestamp * 1000)
   const day = `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}`
   const dir = join(LLM_LOG_DIR, day)
-  const base = join(dir, String(timestamp))
+  const base = join(dir, `${timestamp}_${seq}`)
 
   const work = async () => {
     await mkdir(dir, { recursive: true })
