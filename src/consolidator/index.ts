@@ -116,22 +116,27 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
 
   async function processBatch(ai: InferenceProvider, articles: RawArticle[]): Promise<void> {
     const totalTopics = db.news.topicCount()
-    let offset = 0
+
+    // Collect topic pages first (sync DB calls), then fan out matching across pages in parallel.
+    const topicPages: Topic[][] = []
+    for (let offset = 0; offset < totalTopics; offset += TOPIC_PAGE_SIZE) {
+      const page = db.news.listTopicsPaginated(TOPIC_PAGE_SIZE, offset)
+      if (page.length === 0) break
+      topicPages.push(page)
+    }
+
+    const pageResults = await Promise.all(
+      topicPages.map((page) => matchBatchAgainstTopics(ai, articles, page)),
+    )
+
     // Accumulate matched topics per article across all pages
     const matchesByIndex = new Map<number, Topic[]>()
-
-    while (offset < totalTopics) {
-      const topicPage = db.news.listTopicsPaginated(TOPIC_PAGE_SIZE, offset)
-      if (topicPage.length === 0) break
-
-      const results = await matchBatchAgainstTopics(ai, articles, topicPage)
+    for (const results of pageResults) {
       for (const { articleIndex, topics } of results) {
         const existing = matchesByIndex.get(articleIndex) ?? []
         existing.push(...topics)
         matchesByIndex.set(articleIndex, existing)
       }
-
-      offset += TOPIC_PAGE_SIZE
     }
 
     // Phase 1: Save all matched articles to DB and collect assessment pairs
@@ -195,12 +200,8 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
       }
     }
 
-    // Phase 4: Batch-regenerate summaries for all topics that need it
-    if (topicsNeedingSummary.length > 0) {
-      await regenerateTopicSummaries(ai, db, topicsNeedingSummary)
-    }
-
-    // Phase 5: Batch-create new topics for unmatched articles
+    // Build the unmatched-article list for Phase 5 up front so Phase 4 + Phase 5
+    // can run their LLM-bound work in parallel (they touch disjoint topics).
     const unmatchedArticles: RawArticle[] = []
     for (let i = 0; i < articles.length; i++) {
       const topics = matchesByIndex.get(i)
@@ -209,8 +210,16 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
       }
     }
 
+    const [, newTopicInfos] = await Promise.all([
+      topicsNeedingSummary.length > 0
+        ? regenerateTopicSummaries(ai, db, topicsNeedingSummary)
+        : Promise.resolve(),
+      unmatchedArticles.length > 0
+        ? generateTopicSummaries(ai, unmatchedArticles)
+        : Promise.resolve<{ title: string; description: string }[]>([]),
+    ])
+
     if (unmatchedArticles.length > 0) {
-      const newTopicInfos = await generateTopicSummaries(ai, unmatchedArticles)
       for (let i = 0; i < unmatchedArticles.length; i++) {
         const info = newTopicInfos[i]
         const topic = db.news.createTopic(info.title, info.description)
@@ -343,31 +352,41 @@ async function matchBatchAgainstTopics(
   const renderedTopics = topics.map((t) => `${t.id}: ${t.title} — ${t.description}`)
   const chunks = chunkByTokens(topics, renderedTopics, inputBudget(ai, fixedOverhead))
 
-  const entries: BatchMatchEntry[] = []
+  // Fan out chunks in parallel; merge sequentially after.
+  const chunkResults = await Promise.all(
+    chunks.map(async (chunk): Promise<BatchMatchEntry[]> => {
+      const topicList = chunk.map((t) => `${t.id}: ${t.title} — ${t.description}`).join('\n')
+      const response = await ai.complete(instructionsPrefix + topicList + instructionsSuffix, { reasoningEffort: 'high' })
 
-  for (const chunk of chunks) {
-    const topicList = chunk.map((t) => `${t.id}: ${t.title} — ${t.description}`).join('\n')
-    const response = await ai.complete(instructionsPrefix + topicList + instructionsSuffix, { reasoningEffort: 'high' })
-
-    try {
-      const results = JSON.parse(stripCodeFences(response)) as { article: number; topicIds: number[] }[]
-      for (const result of results) {
-        if (!result.topicIds || result.topicIds.length === 0) continue
-        const matchedTopics = result.topicIds
-          .map((id) => chunk.find((t) => t.id === id))
-          .filter((t): t is Topic => !!t)
-        if (matchedTopics.length > 0) {
-          // Merge into existing entry if one exists for this article index
-          const existing = entries.find((e) => e.articleIndex === result.article)
-          if (existing) {
-            existing.topics.push(...matchedTopics)
-          } else {
-            entries.push({ articleIndex: result.article, topics: matchedTopics })
+      try {
+        const results = JSON.parse(stripCodeFences(response)) as { article: number; topicIds: number[] }[]
+        const out: BatchMatchEntry[] = []
+        for (const result of results) {
+          if (!result.topicIds || result.topicIds.length === 0) continue
+          const matchedTopics = result.topicIds
+            .map((id) => chunk.find((t) => t.id === id))
+            .filter((t): t is Topic => !!t)
+          if (matchedTopics.length > 0) {
+            out.push({ articleIndex: result.article, topics: matchedTopics })
           }
         }
+        return out
+      } catch {
+        console.error('[consolidator] failed to parse batch match response, treating chunk as unmatched:', response)
+        return []
       }
-    } catch {
-      console.error('[consolidator] failed to parse batch match response, treating chunk as unmatched:', response)
+    }),
+  )
+
+  const entries: BatchMatchEntry[] = []
+  for (const chunkEntries of chunkResults) {
+    for (const entry of chunkEntries) {
+      const existing = entries.find((e) => e.articleIndex === entry.articleIndex)
+      if (existing) {
+        existing.topics.push(...entry.topics)
+      } else {
+        entries.push(entry)
+      }
     }
   }
 
@@ -383,7 +402,7 @@ Title: ${article.title}
 Text: ${article.text.slice(0, 500)}
 
 Reply with JSON only: { "title": "short topic title", "description": "one sentence terse description" }`,
-    { reasoningEffort: 'low' },
+    { reasoningEffort: 'off' },
   )
 
   try {
@@ -419,18 +438,18 @@ async function generateTopicSummaries(
   const indexes = articles.map((_, i) => i)
   const chunks = chunkByTokens(indexes, renderedItems, inputBudget(ai, fixedOverhead))
 
-  for (const chunk of chunks) {
+  await Promise.all(chunks.map(async (chunk) => {
     // Single-item chunk: use simpler prompt for better results
     if (chunk.length === 1) {
       results[chunk[0]] = await generateTopicSummary(ai, articles[chunk[0]])
-      continue
+      return
     }
 
     const articleList = chunk
       .map((originalIndex, localIndex) => `${localIndex}: "${articles[originalIndex].title}" — ${articles[originalIndex].text.slice(0, 300)}`)
       .join('\n\n')
 
-    const response = await ai.complete(instructionsPrefix + articleList + instructionsSuffix, { reasoningEffort: 'low' })
+    const response = await ai.complete(instructionsPrefix + articleList + instructionsSuffix, { reasoningEffort: 'off' })
 
     try {
       const parsed = JSON.parse(stripCodeFences(response)) as { index: number; title: string; description: string }[]
@@ -443,7 +462,7 @@ async function generateTopicSummaries(
     } catch {
       console.error('[consolidator] failed to parse batch topic summaries chunk, using fallbacks:', response)
     }
-  }
+  }))
 
   return results
 }
@@ -482,7 +501,7 @@ async function regenerateTopicSummaries(ai: InferenceProvider, db: Db, topicIds:
           `Background: ${ctx.topic.description}\n\n` +
           `Recent articles:\n${ctx.articleContext}\n\n` +
           `Reply with ONLY the summary text, no JSON, no formatting.`,
-        { reasoningEffort: 'low' },
+        { reasoningEffort: 'off' },
       )
       const summary = response.trim()
       if (summary) {
@@ -505,7 +524,7 @@ async function regenerateTopicSummaries(ai: InferenceProvider, db: Db, topicIds:
   )
   const chunks = chunkByTokens(contexts, renderedContexts, inputBudget(ai, fixedOverhead))
 
-  for (const chunk of chunks) {
+  await Promise.all(chunks.map(async (chunk) => {
     // Single-context chunk: use simpler single-topic prompt path
     if (chunk.length === 1) {
       const ctx = chunk[0]
@@ -517,7 +536,7 @@ async function regenerateTopicSummaries(ai: InferenceProvider, db: Db, topicIds:
             `Background: ${ctx.topic.description}\n\n` +
             `Recent articles:\n${ctx.articleContext}\n\n` +
             `Reply with ONLY the summary text, no JSON, no formatting.`,
-          { reasoningEffort: 'low' },
+          { reasoningEffort: 'off' },
         )
         const summary = response.trim()
         if (summary) {
@@ -526,7 +545,7 @@ async function regenerateTopicSummaries(ai: InferenceProvider, db: Db, topicIds:
       } catch {
         console.error(`[consolidator] failed to generate summary for topic ${ctx.topicId}`)
       }
-      continue
+      return
     }
 
     const topicList = chunk
@@ -537,7 +556,7 @@ async function regenerateTopicSummaries(ai: InferenceProvider, db: Db, topicIds:
       .join('\n\n---\n\n')
 
     try {
-      const response = await ai.complete(instructionsPrefix + topicList + instructionsSuffix, { reasoningEffort: 'low' })
+      const response = await ai.complete(instructionsPrefix + topicList + instructionsSuffix, { reasoningEffort: 'off' })
 
       const parsed = JSON.parse(stripCodeFences(response)) as { topicId: number; summary: string }[]
       for (const entry of parsed) {
@@ -551,7 +570,7 @@ async function regenerateTopicSummaries(ai: InferenceProvider, db: Db, topicIds:
     } catch {
       console.error('[consolidator] failed to parse batch summary regeneration chunk, skipping')
     }
-  }
+  }))
 }
 
 /** Single-article assessment (used by ungroupArticle) */
@@ -601,7 +620,7 @@ Determine:
 2. "isConcluded": Does this article indicate the issue/story has reached a conclusion or resolution (e.g., final verdict, deal closed, crisis resolved, investigation completed)?
 
 Reply with ONLY JSON: {"isSubstantial": true/false, "isConcluded": true/false}`,
-      { reasoningEffort: 'high' },
+      { reasoningEffort: 'off' },
     )
 
     try {
@@ -634,19 +653,19 @@ Reply with ONLY JSON: {"isSubstantial": true/false, "isConcluded": true/false}`,
   const pairIndexes = pairs.map((_, i) => i)
   const chunks = chunkByTokens(pairIndexes, renderedPairs, inputBudget(ai, fixedOverhead))
 
-  for (const chunk of chunks) {
+  await Promise.all(chunks.map(async (chunk) => {
     // Single-pair chunk: recurse into the single-pair fast path above
     if (chunk.length === 1) {
       const single = await assessArticleBatch(ai, [pairs[chunk[0]]])
       results[chunk[0]] = single[0]
-      continue
+      return
     }
 
     const pairList = chunk
       .map((originalIndex, localIndex) => renderPair(pairs[originalIndex], localIndex))
       .join('\n\n')
 
-    const response = await ai.complete(instructionsPrefix + pairList + instructionsSuffix, { reasoningEffort: 'high' })
+    const response = await ai.complete(instructionsPrefix + pairList + instructionsSuffix, { reasoningEffort: 'off' })
 
     try {
       const parsed = JSON.parse(stripCodeFences(response)) as { index: number; isSubstantial: boolean; isConcluded: boolean }[]
@@ -662,7 +681,7 @@ Reply with ONLY JSON: {"isSubstantial": true/false, "isConcluded": true/false}`,
     } catch {
       console.error('[consolidator] failed to parse batch assessment chunk, defaulting to non-substantial/non-concluded:', response)
     }
-  }
+  }))
 
   return results
 }
