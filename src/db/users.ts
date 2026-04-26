@@ -31,6 +31,7 @@ export interface UserDb {
   readSignalsInWindow(userId: number, windowMs: number): Signal[]
   getReadTopicIds(userId: number): Set<number>
   setReadTopics(userId: number, topicIds: number[]): void
+  setTopicRead(userId: number, topicId: number, read: boolean): void
   unreadTopicForNonDownvoters(topicId: number): void
   cleanupOldSignals(maxAgeMs: number): void
   saveFrontPage(userId: number, data: string): void
@@ -190,6 +191,16 @@ export function createUserDb(db: DatabaseSync): UserDb {
       } catch (e) {
         db.exec('ROLLBACK')
         throw e
+      }
+    },
+
+    setTopicRead(userId, topicId, read) {
+      if (read) {
+        db.prepare(
+          'INSERT OR REPLACE INTO user_read_topics (user_id, topic_id, read_at) VALUES (?, ?, ?)',
+        ).run(userId, topicId, Date.now())
+      } else {
+        db.prepare('DELETE FROM user_read_topics WHERE user_id = ? AND topic_id = ?').run(userId, topicId)
       }
     },
 
