@@ -4,18 +4,25 @@
   import { isLoggedIn, getFrontPage, vote, subscribeToFrontPage, setReadTopics, getTopicArticles, ungroupArticle } from '$lib/api'
   import type { FrontPage, TopicArticle } from '$lib/api'
   import { timeAgo } from '$lib/time'
+  import { morphingTopicId, morphSnapshot, frontPageCache } from '$lib/transition'
+  import { get } from 'svelte/store'
   import { ThumbsUp, ThumbsDown, CheckCheck, CircleCheck, Circle, Unlink2 } from 'lucide-svelte'
 
-  let page: FrontPage | null = null
-  let loading = true
+  let page: FrontPage | null = get(frontPageCache)
+  let loading = page === null
   let error = ''
   let unsubscribe: (() => void) | null = null
   let votes = new Map<number, 1 | -1>()
   let expandedTopics = new Map<number, TopicArticle[] | 'loading'>()
-  let readTopicIds = new Set<number>()
+  let readTopicIds = new Set<number>(page?.readTopicIds ?? [])
+  // Snapshot of read topics at page-load time — these are hidden from the rendered list.
+  // Topics marked as read in-session aren't added here, so they remain visible (at reduced opacity)
+  // until the next page load, letting the user undo or revisit them.
+  let hiddenReadTopicIds = new Set<number>(page?.readTopicIds ?? [])
   let ungroupingArticles = new Set<number>()
 
   $: sections = page?.sections ?? []
+  $: visibleSections = sections.filter(s => !hiddenReadTopicIds.has(s.topicId))
 
   onMount(async () => {
     if (!isLoggedIn()) {
@@ -23,12 +30,15 @@
       return
     }
     try {
-      page = await getFrontPage()
-      if (page) {
-        readTopicIds = new Set(page.readTopicIds)
+      const fresh = await getFrontPage()
+      if (fresh) {
+        page = fresh
+        readTopicIds = new Set(fresh.readTopicIds)
+        hiddenReadTopicIds = new Set(fresh.readTopicIds)
+        frontPageCache.set(fresh)
       }
     } catch (e) {
-      error = String(e)
+      if (!page) error = String(e)
     } finally {
       loading = false
     }
@@ -39,7 +49,9 @@
         if (newPage) {
           page = newPage
           readTopicIds = new Set(newPage.readTopicIds)
+          hiddenReadTopicIds = new Set(newPage.readTopicIds)
           expandedTopics = new Map()
+          frontPageCache.set(newPage)
         }
       } catch { /* keep old page */ }
     })
@@ -59,11 +71,12 @@
   }
 
   function markReadAtPosition(index: number) {
-    // Everything at indices 0..index becomes read
-    // Everything below becomes unread (if it was previously read)
-    const newRead = new Set<number>()
+    // index is into visibleSections. Visible items at 0..index become read; visible items
+    // below become unread. Hidden (already-read-at-load) topics keep their read state so
+    // shifting the line up doesn't silently un-read items the user can't see.
+    const newRead = new Set<number>(hiddenReadTopicIds)
     for (let i = 0; i <= index; i++) {
-      newRead.add(sections[i].topicId)
+      newRead.add(visibleSections[i].topicId)
     }
     readTopicIds = newRead
     setReadTopics([...newRead])
@@ -105,7 +118,11 @@
       expandedTopics.delete(topicId)
       expandedTopics = expandedTopics
       page = await getFrontPage()
-      if (page) readTopicIds = new Set(page.readTopicIds)
+      if (page) {
+        readTopicIds = new Set(page.readTopicIds)
+        hiddenReadTopicIds = new Set(page.readTopicIds)
+        frontPageCache.set(page)
+      }
     } catch {
       ungroupingArticles.delete(articleId)
       ungroupingArticles = ungroupingArticles
@@ -132,20 +149,31 @@
     </div>
 
     <div class="flex flex-col gap-4">
-    {#each sections as section, i}
+    {#each visibleSections as section, i}
       {@const isRead = readTopicIds.has(section.topicId)}
       {@const topicVote = section.articleIds.map(id => votes.get(id)).find(v => v !== undefined)}
-      <div class="bg-white dark:bg-stone-900 p-5 rounded-xl shadow-md hover:shadow-lg hover:-translate-y-0.5 transition-all duration-200 {isRead ? 'opacity-50' : ''}">
+      {@const isMorphing = $morphingTopicId === section.topicId}
+      <div
+        class="bg-white dark:bg-stone-900 p-5 rounded-xl shadow-md hover:shadow-lg hover:-translate-y-0.5 transition-all duration-200 {isRead ? 'opacity-50' : ''}"
+        style={isMorphing ? 'view-transition-name: topic-card' : ''}
+      >
         <div class="flex gap-3">
           <a
             href={`/topics/${section.topicId}`}
+            onclick={() => morphSnapshot.set({ topicId: section.topicId, title: section.headline, summary: section.summary })}
             class="flex-1 min-w-0 group cursor-pointer"
           >
-            <h2 class="font-serif text-lg font-bold leading-tight mb-1 group-hover:underline decoration-stone-300 dark:decoration-stone-600 underline-offset-2">{section.headline}</h2>
+            <h2
+              class="font-serif text-lg font-bold leading-tight mb-1 group-hover:underline decoration-stone-300 dark:decoration-stone-600 underline-offset-2"
+              style={isMorphing ? 'view-transition-name: topic-title' : ''}
+            >{section.headline}</h2>
             {#if section.topicTitle !== section.headline}
               <p class="text-xs text-stone-400 dark:text-stone-500 uppercase tracking-wide mb-1">{section.topicTitle}</p>
             {/if}
-            <p class="text-sm text-stone-700 dark:text-stone-300 leading-relaxed">{section.summary}</p>
+            <p
+              class="text-sm text-stone-700 dark:text-stone-300 leading-relaxed"
+              style={isMorphing ? 'view-transition-name: topic-summary' : ''}
+            >{section.summary}</p>
           </a>
           <div class="flex flex-col gap-2 items-center shrink-0 pt-0.5">
             <button

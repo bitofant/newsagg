@@ -5,6 +5,7 @@
   import { isLoggedIn, getTopicDetail, vote, setTopicRead, ungroupArticle } from '$lib/api'
   import type { TopicDetail } from '$lib/api'
   import { timeAgo } from '$lib/time'
+  import { morphSnapshot } from '$lib/transition'
   import { ArrowLeft, ThumbsUp, ThumbsDown, CircleCheck, Circle, Unlink2 } from 'lucide-svelte'
 
   let topic = $state<TopicDetail | null>(null)
@@ -94,11 +95,13 @@
   <title>{topic?.title ?? 'Topic'} · newsagg</title>
 </svelte:head>
 
-{#if loading}
-  <p class="text-stone-400 dark:text-stone-500 text-center mt-20">Loading...</p>
-{:else if error}
+{#if error}
   <p class="text-red-500 dark:text-red-400 text-center mt-20">{error}</p>
-{:else if topic}
+{:else}
+  {@const urlId = parseInt(page.params['topicId'] ?? '0', 10)}
+  {@const snap = $morphSnapshot && $morphSnapshot.topicId === urlId ? $morphSnapshot : null}
+  {@const heroTitle = topic?.title ?? snap?.title ?? ''}
+  {@const heroSummary = topic?.summary ?? snap?.summary ?? ''}
   {@const tv = topicVote()}
   <div class="max-w-2xl mx-auto">
     <a
@@ -108,17 +111,30 @@
       <ArrowLeft size={16} /> Front page
     </a>
 
-    <article class="mt-6">
-      <h1 class="font-serif text-3xl md:text-4xl font-bold leading-tight tracking-tight">
-        {topic.title}
-      </h1>
+    <article class="mt-6" style="view-transition-name: topic-card">
+      {#if heroTitle}
+        <h1
+          class="font-serif text-3xl md:text-4xl font-bold leading-tight tracking-tight"
+          style="view-transition-name: topic-title"
+        >
+          {heroTitle}
+        </h1>
+      {/if}
 
-      {#if topic.summary}
-        <p class="mt-5 text-lg leading-relaxed text-stone-700 dark:text-stone-300">
-          {topic.summary}
+      {#if heroSummary}
+        <p
+          class="mt-5 text-lg leading-relaxed text-stone-700 dark:text-stone-300"
+          style="view-transition-name: topic-summary"
+        >
+          {heroSummary}
         </p>
       {/if}
 
+      {#if loading && !snap}
+        <p class="text-stone-400 dark:text-stone-500 text-center mt-10">Loading...</p>
+      {/if}
+
+      {#if topic}
       <div class="mt-7 flex flex-wrap items-center gap-2 border-y border-stone-200 dark:border-stone-800 py-3">
         <button
           onclick={toggleRead}
@@ -186,6 +202,7 @@
           {/each}
         </ul>
       </section>
+      {/if}
     </article>
   </div>
 {/if}

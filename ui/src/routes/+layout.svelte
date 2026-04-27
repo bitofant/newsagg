@@ -1,9 +1,37 @@
 <script lang="ts">
   import '../app.css'
+  import { tick } from 'svelte'
   import { isLoggedIn, logout } from '$lib/api'
-  import { goto } from '$app/navigation'
+  import { goto, onNavigate } from '$app/navigation'
   import { toggleTheme, getTheme } from '$lib/theme'
+  import { morphingTopicId } from '$lib/transition'
   import { Menu, X } from 'lucide-svelte'
+
+  onNavigate(async (navigation) => {
+    const startViewTransition = (document as any).startViewTransition?.bind(document)
+    if (!startViewTransition) {
+      console.warn('[viewTransition] not supported by this browser')
+      return
+    }
+
+    const fromMatch = navigation.from?.url.pathname.match(/^\/topics\/(\d+)/)
+    const toMatch = navigation.to?.url.pathname.match(/^\/topics\/(\d+)/)
+    if (toMatch) morphingTopicId.set(parseInt(toMatch[1], 10))
+    else if (fromMatch) morphingTopicId.set(parseInt(fromMatch[1], 10))
+    else morphingTopicId.set(null)
+
+    // Let the front page re-render with view-transition-name applied
+    // before the browser snapshots the old DOM.
+    await tick()
+
+    console.log('[viewTransition] starting, morphingTopicId=', toMatch?.[1] ?? fromMatch?.[1])
+    return new Promise<void>((resolve) => {
+      startViewTransition(async () => {
+        resolve()
+        await navigation.complete
+      })
+    })
+  })
 
   let { children } = $props()
   let isDark = $state(false)
