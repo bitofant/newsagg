@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte'
   import { getStatus, type Status } from '$lib/api'
+  import RefreshIndicator from '$lib/RefreshIndicator.svelte'
 
   const REFRESH_MS = 5000
 
@@ -10,12 +11,22 @@
   let timer: ReturnType<typeof setInterval> | null = null
   let clock: ReturnType<typeof setInterval> | null = null
 
+  let cycleStartedAt = $state<number | null>(null)
+  let cycleEndedAt = $state<number | null>(null)
+  let lastError = $state(false)
+
   async function refresh() {
+    cycleStartedAt = Date.now()
+    cycleEndedAt = null
     try {
       status = await getStatus()
       error = ''
+      lastError = false
     } catch (e) {
       error = String(e)
+      lastError = true
+    } finally {
+      cycleEndedAt = Date.now()
     }
   }
 
@@ -55,7 +66,10 @@
 </script>
 
 <div class="max-w-3xl">
-  <h1 class="font-serif text-2xl font-bold mb-6">Status</h1>
+  <div class="flex items-center justify-between mb-6">
+    <h1 class="font-serif text-2xl font-bold">Status</h1>
+    <RefreshIndicator {cycleStartedAt} {cycleEndedAt} {lastError} cycleMs={REFRESH_MS} />
+  </div>
 
   {#if error}
     <p class="text-red-500 dark:text-red-400 text-sm mb-4">{error}</p>
