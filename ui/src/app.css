@@ -6,3 +6,19 @@
   --font-sans: 'DM Sans', sans-serif;
   --font-serif: 'Lora', serif;
 }
+
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 320ms;
+  animation-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+::view-transition-old(topic-card),
+::view-transition-new(topic-card),
+::view-transition-old(topic-title),
+::view-transition-new(topic-title),
+::view-transition-old(topic-summary),
+::view-transition-new(topic-summary) {
+  animation-duration: 420ms;
+  animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+}
