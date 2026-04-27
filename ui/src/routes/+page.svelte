@@ -3,6 +3,7 @@
   import { goto } from '$app/navigation'
   import { isLoggedIn, getFrontPage, vote, subscribeToFrontPage, setReadTopics, getTopicArticles, ungroupArticle } from '$lib/api'
   import type { FrontPage, TopicArticle } from '$lib/api'
+  import { timeAgo } from '$lib/time'
   import { ThumbsUp, ThumbsDown, CheckCheck, CircleCheck, Circle, Unlink2 } from 'lucide-svelte'
 
   let page: FrontPage | null = null
@@ -111,13 +112,6 @@
     }
   }
 
-  function timeAgo(ts: number): string {
-    const diff = Date.now() - ts
-    if (diff < 60_000) return 'just now'
-    if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`
-    if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`
-    return `${Math.floor(diff / 86_400_000)}d ago`
-  }
 </script>
 
 {#if loading}
@@ -143,13 +137,16 @@
       {@const topicVote = section.articleIds.map(id => votes.get(id)).find(v => v !== undefined)}
       <div class="bg-white dark:bg-stone-900 p-5 rounded-xl shadow-md hover:shadow-lg hover:-translate-y-0.5 transition-all duration-200 {isRead ? 'opacity-50' : ''}">
         <div class="flex gap-3">
-          <div class="flex-1 min-w-0">
-            <h2 class="font-serif text-lg font-bold leading-tight mb-1">{section.headline}</h2>
+          <a
+            href={`/topics/${section.topicId}`}
+            class="flex-1 min-w-0 group cursor-pointer"
+          >
+            <h2 class="font-serif text-lg font-bold leading-tight mb-1 group-hover:underline decoration-stone-300 dark:decoration-stone-600 underline-offset-2">{section.headline}</h2>
             {#if section.topicTitle !== section.headline}
               <p class="text-xs text-stone-400 dark:text-stone-500 uppercase tracking-wide mb-1">{section.topicTitle}</p>
             {/if}
             <p class="text-sm text-stone-700 dark:text-stone-300 leading-relaxed">{section.summary}</p>
-          </div>
+          </a>
           <div class="flex flex-col gap-2 items-center shrink-0 pt-0.5">
             <button
               onclick={() => toggleRead(section.topicId)}

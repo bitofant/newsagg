@@ -33,6 +33,7 @@ export interface NewsDb {
   /** Paginated topics ordered by created_at DESC, for batched consolidator matching */
   listTopicsPaginated(limit: number, offset: number): Topic[]
   topicCount(): number
+  getTopic(id: number): Topic | null
   createTopic(title: string, description: string): Topic
   updateTopicTimestamp(id: number): void
   articleExistsByUrl(url: string): boolean
@@ -94,6 +95,30 @@ export function createNewsDb(db: DatabaseSync): NewsDb {
     topicCount() {
       const row = db.prepare('SELECT COUNT(*) as count FROM topics').get() as { count: number }
       return row.count
+    },
+
+    getTopic(id) {
+      const r = db
+        .prepare('SELECT id, title, description, summary, created_at, updated_at FROM topics WHERE id = ?')
+        .get(id) as
+        | {
+            id: number
+            title: string
+            description: string
+            summary: string | null
+            created_at: number
+            updated_at: number
+          }
+        | undefined
+      if (!r) return null
+      return {
+        id: r.id,
+        title: r.title,
+        description: r.description,
+        summary: r.summary,
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+      }
     },
 
     totalArticleCount() {

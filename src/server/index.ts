@@ -128,6 +128,17 @@ export async function createServer({ db, aggregator, consolidator, profiler, con
     return { ok: true }
   })
 
+  app.put('/api/readtopics/:topicId', async (req, reply) => {
+    const userId = authenticate(req)
+    if (!userId) return reply.status(401).send({ error: 'unauthorized' })
+    const topicId = parseInt((req.params as { topicId: string }).topicId, 10)
+    if (isNaN(topicId)) return reply.status(400).send({ error: 'invalid topicId' })
+    const { read } = req.body as { read?: boolean }
+    if (typeof read !== 'boolean') return reply.status(400).send({ error: 'read (boolean) required' })
+    db.users.setTopicRead(userId, topicId, read)
+    return { ok: true }
+  })
+
   // --- Voting ---
   app.post('/api/vote', async (req, reply) => {
     const userId = authenticate(req)
@@ -179,6 +190,36 @@ export async function createServer({ db, aggregator, consolidator, profiler, con
   })
 
   // --- Topics ---
+
+  app.get('/api/topics/:topicId', async (req, reply) => {
+    const userId = authenticate(req)
+    if (!userId) return reply.status(401).send({ error: 'unauthorized' })
+
+    const topicId = parseInt((req.params as { topicId: string }).topicId, 10)
+    if (isNaN(topicId)) return reply.status(400).send({ error: 'invalid topicId' })
+
+    const topic = db.news.getTopic(topicId)
+    if (!topic) return reply.status(404).send({ error: 'topic not found' })
+
+    const articles = db.news.listArticlesByTopic(topicId).map(({ id, title, source, url, fetchedAt }) => ({
+      id,
+      title,
+      source,
+      url,
+      fetchedAt,
+    }))
+    const isRead = db.users.getReadTopicIds(userId).has(topicId)
+
+    return {
+      id: topic.id,
+      title: topic.title,
+      summary: topic.summary,
+      createdAt: topic.createdAt,
+      updatedAt: topic.updatedAt,
+      isRead,
+      articles,
+    }
+  })
 
   app.get('/api/topics/:topicId/articles', async (req, reply) => {
     const userId = authenticate(req)

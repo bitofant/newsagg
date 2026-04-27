@@ -89,14 +89,15 @@ A personal news aggregator that collects articles from RSS feeds, consolidates t
    - Mobile-responsive single-column front page per user (up to 100 topics)
    - Icons via `lucide-svelte` (tree-shakeable SVG icons, styled via Tailwind `currentColor`)
    - Per-card vertical button column (right-aligned): read/unread toggle (`CircleCheck`/`Circle`), thumbs up (`ThumbsUp`), thumbs down (`ThumbsDown`)
-   - "Mark above as read" dividers between topic cards: clicking marks all topics above as read (and topics below as unread); read state persisted via `POST /api/readtopics`
+   - "Mark above as read" dividers between topic cards: clicking marks all topics above as read (and topics below as unread); read state persisted via `POST /api/readtopics` (atomic full replace). Single-topic toggles use `PUT /api/readtopics/:topicId { read }` (delta).
    - Read topics shown below unread section at reduced opacity
    - Login/register flow
    - Thumbs up/down voting on articles
    - SSE subscription for live front page updates (auto-refreshes on new generation)
-   - Topic detail view: click "N sources" on a card to expand inline article list with titles (linked to original), source names, and relative timestamps; lazy-loaded via `GET /api/topics/:topicId/articles`
-   - Per-article ungroup button (`Unlink2` icon) in expanded source list: removes article from topic and re-classifies it via `POST /api/topics/:topicId/articles/:articleId/ungroup`
-   - Status page at `/status` (no auth, not linked from nav): LLM metrics (busy %, req/min, tok/s over `ai.statusWindowMs`), consolidator buffer depth + processing flag + estimated backlog duration, aggregator queue length + active workers, topic/article counts, a Deployable card (build time from mtime of `dist/server/index.js` + process uptime), and a per-user list with interval / last-front-page age / overdue status / 14-day signal count. All relative times tick every second. Auto-refreshes every 5s. Data source: `GET /api/status`.
+   - Inline source expander: click "N sources" on a card to expand article list with titles (linked to original), source names, and relative timestamps; lazy-loaded via `GET /api/topics/:topicId/articles`
+   - **Topic detail page** at `/topics/:topicId`: clicking the title/summary area of a card navigates to a polished, hero-style view (larger typography, roomier `max-w-2xl` layout, labelled action buttons). Loads bundled topic metadata + articles + read state via `GET /api/topics/:topicId`. Shareable URL. Same vote / read / ungroup actions as the card. Empty topics (after ungroup) redirect to `/`.
+   - Per-article ungroup button (`Unlink2` icon) in inline source list and detail page: removes article from topic and re-classifies it via `POST /api/topics/:topicId/articles/:articleId/ungroup`
+   - Status page at `/status` (no auth, not linked from nav): LLM metrics (busy %, req/min, tok/s over `ai.statusWindowMs`), consolidator buffer depth + processing flag + estimated backlog duration, aggregator queue length + active workers, topic/article counts, a Deployable card (build time from mtime of `dist/server/index.js` + process uptime), and a per-user list with interval / last-front-page age / overdue status / 14-day signal count. All relative times tick every second. Auto-refreshes every 5s; a `RefreshIndicator` ring next to the title visualizes the poll cycle (blue fills 0→100% over 2s while in-flight, orange if still pending after 2s, then green/red on response and drains over the remainder of the cycle). State changes push fresh DOM nodes that fade in over the prior one's fade-out, so transitions never get re-targeted mid-flight. Data source: `GET /api/status`.
 
 ### Implementation Status Tracking
 
@@ -148,6 +149,7 @@ npm start            # run compiled output
 # Production ops (survive SSH disconnect)
 ./start.sh           # nohup launch, pid in newsagg.pid, log in newsagg.log
 ./stop.sh            # stop via pidfile
+./status.sh          # check if running via pidfile (exit 0 = running, 1 = not)
 ./rebuild.sh         # build UI + compile backend
 ./restart.sh         # stop → rebuild → start
 

@@ -63,6 +63,14 @@ export async function setReadTopics(topicIds: number[]): Promise<void> {
   })
 }
 
+export async function setTopicRead(topicId: number, read: boolean): Promise<void> {
+  await fetch(`${BASE}/readtopics/${topicId}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ read }),
+  })
+}
+
 export async function vote(articleId: number, vote: 1 | -1 | 0): Promise<void> {
   await fetch(`${BASE}/vote`, {
     method: 'POST',
@@ -83,6 +91,23 @@ export async function getTopicArticles(topicId: number): Promise<TopicArticle[]>
   const res = await fetch(`${BASE}/topics/${topicId}/articles`, { headers: authHeaders() })
   if (!res.ok) throw new Error('Failed to load articles')
   return res.json() as Promise<TopicArticle[]>
+}
+
+export interface TopicDetail {
+  id: number
+  title: string
+  summary: string | null
+  createdAt: number
+  updatedAt: number
+  isRead: boolean
+  articles: TopicArticle[]
+}
+
+export async function getTopicDetail(topicId: number): Promise<TopicDetail | null> {
+  const res = await fetch(`${BASE}/topics/${topicId}`, { headers: authHeaders() })
+  if (res.status === 404) return null
+  if (!res.ok) throw new Error('Failed to load topic')
+  return res.json() as Promise<TopicDetail>
 }
 
 export async function ungroupArticle(topicId: number, articleId: number): Promise<{ newTopicIds: number[] }> {
