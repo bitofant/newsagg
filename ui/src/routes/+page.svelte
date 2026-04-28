@@ -1,12 +1,12 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte'
   import { goto } from '$app/navigation'
-  import { isLoggedIn, getFrontPage, vote, subscribeToFrontPage, setReadTopics, getTopicArticles, ungroupArticle } from '$lib/api'
+  import { isLoggedIn, getFrontPage, vote, subscribeToFrontPage, setReadTopics, getTopicArticles, ungroupArticle, requestFrontPage } from '$lib/api'
   import type { FrontPage, TopicArticle } from '$lib/api'
   import { timeAgo } from '$lib/time'
   import { morphingTopicId, morphSnapshot, frontPageCache } from '$lib/transition'
   import { get } from 'svelte/store'
-  import { ThumbsUp, ThumbsDown, CheckCheck, CircleCheck, Circle, Unlink2 } from 'lucide-svelte'
+  import { ThumbsUp, ThumbsDown, CheckCheck, CircleCheck, Circle, Unlink2, RefreshCw } from 'lucide-svelte'
 
   let page: FrontPage | null = get(frontPageCache)
   let loading = page === null
@@ -20,6 +20,7 @@
   // until the next page load, letting the user undo or revisit them.
   let hiddenReadTopicIds = new Set<number>(page?.readTopicIds ?? [])
   let ungroupingArticles = new Set<number>()
+  let regenerating = false
 
   $: sections = page?.sections ?? []
   $: visibleSections = sections.filter(s => !hiddenReadTopicIds.has(s.topicId))
@@ -54,6 +55,7 @@
           frontPageCache.set(newPage)
         }
       } catch { /* keep old page */ }
+      regenerating = false
     })
   })
 
@@ -110,6 +112,16 @@
     expandedTopics = expandedTopics
   }
 
+  async function handleRegenerate() {
+    if (regenerating) return
+    regenerating = true
+    try {
+      await requestFrontPage()
+    } catch {
+      regenerating = false
+    }
+  }
+
   async function handleUngroup(topicId: number, articleId: number) {
     ungroupingArticles.add(articleId)
     ungroupingArticles = ungroupingArticles
@@ -142,10 +154,19 @@
   </div>
 {:else}
   <div class="max-w-3xl mx-auto">
-    <div class="mb-8 border-b border-stone-200 dark:border-stone-800 pb-2">
+    <div class="mb-8 border-b border-stone-200 dark:border-stone-800 pb-2 flex items-center justify-between gap-4">
       <p class="text-xs text-stone-400 dark:text-stone-500 uppercase tracking-widest">
         {new Date(page.generatedAt).toLocaleString()}
       </p>
+      <button
+        onclick={handleRegenerate}
+        disabled={regenerating}
+        class="text-xs text-stone-400 dark:text-stone-500 uppercase tracking-widest hover:text-stone-600 dark:hover:text-stone-300 transition-colors flex items-center gap-1.5 disabled:cursor-not-allowed"
+        title="Generate a new front page now"
+      >
+        <RefreshCw size={12} class={regenerating ? 'animate-spin' : ''} />
+        {regenerating ? 'Generating' : 'Refresh'}
+      </button>
     </div>
 
     <div class="flex flex-col gap-4">

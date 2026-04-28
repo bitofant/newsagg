@@ -5,7 +5,8 @@
   import { goto, onNavigate } from '$app/navigation'
   import { toggleTheme, getTheme } from '$lib/theme'
   import { morphingTopicId } from '$lib/transition'
-  import { Menu, X } from 'lucide-svelte'
+  import { Menu, X, Sun, Moon, Settings, Activity, LogOut } from 'lucide-svelte'
+  import { slide } from 'svelte/transition'
 
   onNavigate(async (navigation) => {
     const startViewTransition = (document as any).startViewTransition?.bind(document)
@@ -63,39 +64,47 @@
 <svelte:window onclick={closeMenu} />
 
 <div class="min-h-screen flex flex-col bg-stone-50 dark:bg-stone-950">
-  <header class="border-b border-stone-300 dark:border-stone-700 bg-white dark:bg-stone-900">
-    <div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
-      <a href="/" class="font-serif text-2xl font-bold tracking-tight">newsagg</a>
-      <div class="relative menu-container">
-        <button onclick={() => menuOpen = !menuOpen} class="p-1 text-stone-500 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-100" title="Menu">
+  <header class="border-b border-stone-300 dark:border-stone-700 bg-white dark:bg-stone-900 menu-container">
+    <div class="max-w-5xl mx-auto px-4">
+      <div class="py-3 flex items-center justify-between">
+        <a href="/" class="font-serif text-2xl font-bold tracking-tight">newsagg</a>
+        <button onclick={() => menuOpen = !menuOpen} class="-m-3 p-4 text-stone-500 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-100" title="Menu">
           {#if menuOpen}
             <X size={20} />
           {:else}
             <Menu size={20} />
           {/if}
         </button>
-        {#if menuOpen}
-          <div class="absolute right-0 top-full mt-2 w-48 bg-white dark:bg-stone-800 rounded-xl shadow-lg border border-stone-200 dark:border-stone-700 py-1 z-50">
-            <button onclick={() => { handleToggleTheme(); menuOpen = false }} class="w-full text-left px-4 py-2 text-sm text-stone-600 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-700">
-              {isDark ? '☀️ Light mode' : '🌙 Dark mode'}
-            </button>
-            {#if isLoggedIn()}
-              <a href="/settings" onclick={() => menuOpen = false} class="block px-4 py-2 text-sm text-stone-600 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-700">
-                Settings
-              </a>
-            {/if}
-            <a href="/status" onclick={() => menuOpen = false} class="block px-4 py-2 text-sm text-stone-600 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-700">
-              Status
-            </a>
-            {#if isLoggedIn()}
-              <div class="border-t border-stone-200 dark:border-stone-700 my-1"></div>
-              <button onclick={handleLogout} class="w-full text-left px-4 py-2 text-sm text-stone-600 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-700">
-                Sign out
-              </button>
-            {/if}
-          </div>
-        {/if}
       </div>
+      {#if menuOpen}
+        <nav transition:slide={{ duration: 200 }} class="border-t border-stone-200 dark:border-stone-700 py-2">
+          <button onclick={() => { handleToggleTheme(); menuOpen = false }} class="w-full flex items-center gap-3 px-2 py-3 text-stone-600 dark:text-stone-300 hover:text-stone-900 dark:hover:text-stone-100">
+            {#if isDark}
+              <Sun size={18} />
+              <span>Light mode</span>
+            {:else}
+              <Moon size={18} />
+              <span>Dark mode</span>
+            {/if}
+          </button>
+          {#if isLoggedIn()}
+            <a href="/settings" onclick={() => menuOpen = false} class="w-full flex items-center gap-3 px-2 py-3 text-stone-600 dark:text-stone-300 hover:text-stone-900 dark:hover:text-stone-100">
+              <Settings size={18} />
+              <span>Settings</span>
+            </a>
+          {/if}
+          <a href="/status" onclick={() => menuOpen = false} class="w-full flex items-center gap-3 px-2 py-3 text-stone-600 dark:text-stone-300 hover:text-stone-900 dark:hover:text-stone-100">
+            <Activity size={18} />
+            <span>Status</span>
+          </a>
+          {#if isLoggedIn()}
+            <button onclick={handleLogout} class="w-full flex items-center gap-3 px-2 py-3 text-stone-600 dark:text-stone-300 hover:text-stone-900 dark:hover:text-stone-100">
+              <LogOut size={18} />
+              <span>Sign out</span>
+            </button>
+          {/if}
+        </nav>
+      {/if}
     </div>
   </header>
 

@@ -117,6 +117,13 @@ export async function createServer({ db, aggregator, consolidator, profiler, con
     return { ...page, readTopicIds }
   })
 
+  app.post('/api/frontpage', async (req, reply) => {
+    const userId = authenticate(req)
+    if (!userId) return reply.status(401).send({ error: 'unauthorized' })
+    aggregator.requestFrontPage(userId)
+    return { ok: true }
+  })
+
   app.post('/api/readtopics', async (req, reply) => {
     const userId = authenticate(req)
     if (!userId) return reply.status(401).send({ error: 'unauthorized' })

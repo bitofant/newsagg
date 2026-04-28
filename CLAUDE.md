@@ -75,6 +75,7 @@ A personal news aggregator that collects articles from RSS feeds, consolidates t
    - Up to 100 topics per front page, scored by signal priority
    - Uses persistent topic summaries (from consolidator) or first-article text for single-article topics
    - Per-user generation interval (stored in users table, checked every 30s tick)
+   - Manual on-demand generation: `aggregator.requestFrontPage(userId)` enqueues a job immediately, bypassing the interval check; reached from `POST /api/frontpage` and surfaced in the UI as a "Refresh" button next to the front-page date
    - In-memory async worker pool with N configurable workers to avoid saturating Ollama
    - If user has preference profile: single LLM call for relevance scoring (1-5) on topic titles, re-sorts by relevance
    - Front pages persisted in SQLite `front_pages` table
