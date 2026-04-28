@@ -44,6 +44,8 @@ export interface FrontPage {
     topicTitle: string
     headline: string
     summary: string
+    bullets: string[] | null
+    newInfo: string[] | null
     articleIds: number[]
   }[]
 }
@@ -97,6 +99,8 @@ export interface TopicDetail {
   id: number
   title: string
   summary: string | null
+  bullets: string[] | null
+  newInfo: string[] | null
   createdAt: number
   updatedAt: number
   isRead: boolean

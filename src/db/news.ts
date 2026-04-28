@@ -5,9 +5,60 @@ export interface Topic {
   title: string
   description: string
   summary: string | null
+  bullets: string[] | null
+  newInfo: string[] | null
+  substantialEventTimestamps: number[]
   createdAt: number
   updatedAt: number
 }
+
+interface TopicRow {
+  id: number
+  title: string
+  description: string
+  summary: string | null
+  bullets: string | null
+  new_info: string | null
+  substantial_event_timestamps: string | null
+  created_at: number
+  updated_at: number
+}
+
+function parseStringArray(json: string | null): string[] | null {
+  if (!json) return null
+  try {
+    const parsed = JSON.parse(json)
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : null
+  } catch {
+    return null
+  }
+}
+
+function parseNumberArray(json: string | null): number[] {
+  if (!json) return []
+  try {
+    const parsed = JSON.parse(json)
+    return Array.isArray(parsed) ? parsed.filter((x): x is number => typeof x === 'number') : []
+  } catch {
+    return []
+  }
+}
+
+function rowToTopic(r: TopicRow): Topic {
+  return {
+    id: r.id,
+    title: r.title,
+    description: r.description,
+    summary: r.summary,
+    bullets: parseStringArray(r.bullets),
+    newInfo: parseStringArray(r.new_info),
+    substantialEventTimestamps: parseNumberArray(r.substantial_event_timestamps),
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  }
+}
+
+const TOPIC_COLUMNS = 'id, title, description, summary, bullets, new_info, substantial_event_timestamps, created_at, updated_at'
 
 export interface Article {
   id: number
@@ -42,6 +93,10 @@ export interface NewsDb {
   listArticlesByTopic(topicId: number): Article[]
   listRecentArticlesByTopic(topicId: number, limit: number): Article[]
   updateTopicSummary(topicId: number, summary: string): void
+  /** Long-form update for topics with bullets format. Writes summary + JSON-serialized arrays. */
+  updateTopicLongForm(topicId: number, fields: { summary: string; bullets: string[]; newInfo: string[] }): void
+  /** Append a substantial-event timestamp to the topic and return the updated array. */
+  appendSubstantialEventTimestamp(topicId: number, ts: number): number[]
   getArticleCountByTopic(topicId: number): number
   getArticleById(id: number): Article | undefined
   unlinkArticleFromTopic(articleId: number, topicId: number): void
@@ -54,42 +109,14 @@ export function createNewsDb(db: DatabaseSync): NewsDb {
   return {
     listTopics() {
       return (
-        db.prepare('SELECT id, title, description, summary, created_at, updated_at FROM topics ORDER BY updated_at DESC').all() as {
-          id: number
-          title: string
-          description: string
-          summary: string | null
-          created_at: number
-          updated_at: number
-        }[]
-      ).map((r) => ({
-        id: r.id,
-        title: r.title,
-        description: r.description,
-        summary: r.summary,
-        createdAt: r.created_at,
-        updatedAt: r.updated_at,
-      }))
+        db.prepare(`SELECT ${TOPIC_COLUMNS} FROM topics ORDER BY updated_at DESC`).all() as unknown as TopicRow[]
+      ).map(rowToTopic)
     },
 
     listTopicsPaginated(limit, offset) {
       return (
-        db.prepare('SELECT id, title, description, summary, created_at, updated_at FROM topics ORDER BY created_at DESC LIMIT ? OFFSET ?').all(limit, offset) as {
-          id: number
-          title: string
-          description: string
-          summary: string | null
-          created_at: number
-          updated_at: number
-        }[]
-      ).map((r) => ({
-        id: r.id,
-        title: r.title,
-        description: r.description,
-        summary: r.summary,
-        createdAt: r.created_at,
-        updatedAt: r.updated_at,
-      }))
+        db.prepare(`SELECT ${TOPIC_COLUMNS} FROM topics ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(limit, offset) as unknown as TopicRow[]
+      ).map(rowToTopic)
     },
 
     topicCount() {
@@ -98,27 +125,9 @@ export function createNewsDb(db: DatabaseSync): NewsDb {
     },
 
     getTopic(id) {
-      const r = db
-        .prepare('SELECT id, title, description, summary, created_at, updated_at FROM topics WHERE id = ?')
-        .get(id) as
-        | {
-            id: number
-            title: string
-            description: string
-            summary: string | null
-            created_at: number
-            updated_at: number
-          }
-        | undefined
+      const r = db.prepare(`SELECT ${TOPIC_COLUMNS} FROM topics WHERE id = ?`).get(id) as unknown as TopicRow | undefined
       if (!r) return null
-      return {
-        id: r.id,
-        title: r.title,
-        description: r.description,
-        summary: r.summary,
-        createdAt: r.created_at,
-        updatedAt: r.updated_at,
-      }
+      return rowToTopic(r)
     },
 
     totalArticleCount() {
@@ -131,7 +140,17 @@ export function createNewsDb(db: DatabaseSync): NewsDb {
       const result = db
         .prepare('INSERT INTO topics (title, description, created_at, updated_at) VALUES (?, ?, ?, ?)')
         .run(title, description, now, now)
-      return { id: Number(result.lastInsertRowid), title, description, summary: null, createdAt: now, updatedAt: now }
+      return {
+        id: Number(result.lastInsertRowid),
+        title,
+        description,
+        summary: null,
+        bullets: null,
+        newInfo: null,
+        substantialEventTimestamps: [],
+        createdAt: now,
+        updatedAt: now,
+      }
     },
 
     updateTopicTimestamp(id) {
@@ -220,6 +239,26 @@ export function createNewsDb(db: DatabaseSync): NewsDb {
 
     updateTopicSummary(topicId, summary) {
       db.prepare('UPDATE topics SET summary = ? WHERE id = ?').run(summary, topicId)
+    },
+
+    updateTopicLongForm(topicId, { summary, bullets, newInfo }) {
+      db.prepare('UPDATE topics SET summary = ?, bullets = ?, new_info = ?, updated_at = ? WHERE id = ?').run(
+        summary,
+        JSON.stringify(bullets),
+        JSON.stringify(newInfo),
+        Date.now(),
+        topicId,
+      )
+    },
+
+    appendSubstantialEventTimestamp(topicId, ts) {
+      const row = db.prepare('SELECT substantial_event_timestamps FROM topics WHERE id = ?').get(topicId) as
+        | { substantial_event_timestamps: string | null }
+        | undefined
+      const current = parseNumberArray(row?.substantial_event_timestamps ?? null)
+      const updated = [...current, ts]
+      db.prepare('UPDATE topics SET substantial_event_timestamps = ? WHERE id = ?').run(JSON.stringify(updated), topicId)
+      return updated
     },
 
     getArticleCountByTopic(topicId) {

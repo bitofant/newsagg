@@ -174,6 +174,16 @@
               class="text-sm text-stone-700 dark:text-stone-300 leading-relaxed"
               style={isMorphing ? 'view-transition-name: topic-summary' : ''}
             >{section.summary}</p>
+            {#if (section.bullets?.length ?? 0) + (section.newInfo?.length ?? 0) > 0}
+              <ul class="mt-3 space-y-1 list-disc list-inside text-sm text-stone-700 dark:text-stone-300 leading-relaxed">
+                {#each section.newInfo ?? [] as item}
+                  <li><strong class="text-amber-600 dark:text-amber-400">NEW:</strong> {item}</li>
+                {/each}
+                {#each section.bullets ?? [] as item}
+                  <li>{item}</li>
+                {/each}
+              </ul>
+            {/if}
           </a>
           <div class="flex flex-col gap-2 items-center shrink-0 pt-0.5">
             <button

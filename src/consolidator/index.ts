@@ -8,6 +8,8 @@ import type { Topic } from '../db/news.js'
 const TOPIC_PAGE_SIZE = 50
 const ARTICLE_BATCH_SIZE = 10
 const DRAIN_INTERVAL_MS = 5_000
+/** A topic switches from prose-only summary to summary+bullets format once it has had this many `substantial_new_info` events. */
+const BULLETS_THRESHOLD = 2
 
 /** Slack for tokenization inaccuracy and unexpected prompt expansion. */
 const BUDGET_SAFETY_MARGIN = 256
@@ -182,6 +184,7 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
       const assessment = assessments[i] ?? { isSubstantial: false, isConcluded: false }
 
       if (assessment.isSubstantial) {
+        db.news.appendSubstantialEventTimestamp(pair.topic.id, Date.now())
         db.users.enqueueSignalForAllUsers({ type: 'substantial_new_info', topicId: pair.topic.id, articleId: pair.savedId })
         db.users.unreadTopicForNonDownvoters(pair.topic.id)
       } else {
@@ -467,36 +470,56 @@ async function generateTopicSummaries(
   return results
 }
 
-/** Batch-regenerate summaries for multiple topics in one LLM call */
+interface TopicContext {
+  topicId: number
+  topic: Topic
+  articleContext: string
+}
+
+/**
+ * Regenerate summaries for the given topics. Each topic is dispatched to short-mode (prose only)
+ * or long-mode (summary + bullets + newInfo) based on its substantial-event timestamp count.
+ * Both groups run in parallel.
+ */
 async function regenerateTopicSummaries(ai: InferenceProvider, db: Db, topicIds: number[]): Promise<void> {
-  // Gather context for each topic
-  interface TopicContext {
-    topicId: number
-    topic: Topic
-    articleContext: string
-  }
-  const contexts: TopicContext[] = []
+  const shortContexts: TopicContext[] = []
+  const longContexts: TopicContext[] = []
 
   for (const topicId of topicIds) {
     const articles = db.news.listRecentArticlesByTopic(topicId, 10)
     if (articles.length < 2) continue
-    const topic = db.news.listTopics().find((t) => t.id === topicId)
+    const topic = db.news.getTopic(topicId)
     if (!topic) continue
     const articleContext = articles
       .map((a) => `- "${a.title}" (${a.source}): ${a.text.slice(0, 200)}`)
       .join('\n')
-    contexts.push({ topicId, topic, articleContext })
+    const ctx: TopicContext = { topicId, topic, articleContext }
+    if (topic.substantialEventTimestamps.length >= BULLETS_THRESHOLD) {
+      longContexts.push(ctx)
+    } else {
+      shortContexts.push(ctx)
+    }
   }
 
-  if (contexts.length === 0) return
+  await Promise.all([
+    shortContexts.length > 0 ? regenerateShortMode(ai, db, shortContexts) : Promise.resolve(),
+    longContexts.length > 0 ? regenerateLongMode(ai, db, longContexts) : Promise.resolve(),
+  ])
+}
 
-  // Single topic — use simpler prompt
+/** Single-topic regen wrapper (used by ungroupArticle) — dispatches by mode internally. */
+async function regenerateTopicSummary(ai: InferenceProvider, db: Db, topicId: number): Promise<void> {
+  return regenerateTopicSummaries(ai, db, [topicId])
+}
+
+async function regenerateShortMode(ai: InferenceProvider, db: Db, contexts: TopicContext[]): Promise<void> {
   if (contexts.length === 1) {
     const ctx = contexts[0]
     try {
       const response = await ai.complete(
         `You are a news editor. Write a concise 2-3 sentence summary of this news topic based on the latest articles.\n` +
-          `Some articles may cover multiple topics — focus ONLY on aspects relevant to this specific topic.\n\n` +
+          `Some articles may cover multiple topics — focus ONLY on aspects relevant to this specific topic.\n` +
+          `Prefer concrete facts (who/what/when) over mood or analysis. Skip emotional content unless paired with a real event.\n\n` +
           `Topic: ${ctx.topic.title}\n` +
           `Background: ${ctx.topic.description}\n\n` +
           `Recent articles:\n${ctx.articleContext}\n\n` +
@@ -513,8 +536,7 @@ async function regenerateTopicSummaries(ai: InferenceProvider, db: Db, topicIds:
     return
   }
 
-  // Multiple topics — split by token budget and batch each chunk
-  const instructionsPrefix = `You are a news editor. Write concise 2-3 sentence summaries for each of the following news topics based on their latest articles.\nSome articles may cover multiple topics — focus ONLY on aspects relevant to each specific topic.\n\n`
+  const instructionsPrefix = `You are a news editor. Write concise 2-3 sentence summaries for each of the following news topics based on their latest articles.\nSome articles may cover multiple topics — focus ONLY on aspects relevant to each specific topic.\nPrefer concrete facts (who/what/when) over mood or analysis. Skip emotional content unless paired with a real event.\n\n`
   const instructionsSuffix = `\n\nReply with a JSON array where each entry has "topicId" (the topic ID number) and "summary" (the 2-3 sentence summary text).\n\nExample: [{"topicId": 5, "summary": "..."}, {"topicId": 12, "summary": "..."}]\n\nReply with ONLY the JSON array, no other text.`
   const fixedOverhead = estimateTokens(instructionsPrefix + instructionsSuffix)
 
@@ -525,26 +547,8 @@ async function regenerateTopicSummaries(ai: InferenceProvider, db: Db, topicIds:
   const chunks = chunkByTokens(contexts, renderedContexts, inputBudget(ai, fixedOverhead))
 
   await Promise.all(chunks.map(async (chunk) => {
-    // Single-context chunk: use simpler single-topic prompt path
     if (chunk.length === 1) {
-      const ctx = chunk[0]
-      try {
-        const response = await ai.complete(
-          `You are a news editor. Write a concise 2-3 sentence summary of this news topic based on the latest articles.\n` +
-            `Some articles may cover multiple topics — focus ONLY on aspects relevant to this specific topic.\n\n` +
-            `Topic: ${ctx.topic.title}\n` +
-            `Background: ${ctx.topic.description}\n\n` +
-            `Recent articles:\n${ctx.articleContext}\n\n` +
-            `Reply with ONLY the summary text, no JSON, no formatting.`,
-          { reasoningEffort: 'off' },
-        )
-        const summary = response.trim()
-        if (summary) {
-          db.news.updateTopicSummary(ctx.topicId, summary)
-        }
-      } catch {
-        console.error(`[consolidator] failed to generate summary for topic ${ctx.topicId}`)
-      }
+      await regenerateShortMode(ai, db, chunk)
       return
     }
 
@@ -573,9 +577,127 @@ async function regenerateTopicSummaries(ai: InferenceProvider, db: Db, topicIds:
   }))
 }
 
-/** Single-article assessment (used by ungroupArticle) */
-async function regenerateTopicSummary(ai: InferenceProvider, db: Db, topicId: number): Promise<void> {
-  return regenerateTopicSummaries(ai, db, [topicId])
+const LONG_MODE_STYLE_RULES = `CRITICAL — bullet style: extremely terse, half-sentence headlines, like a newspaper ticker. Aim for 3-7 words per bullet. Drop articles, conjunctions, hedging.
+  GOOD: "Trump insults Pope"
+  GOOD: "Russia advances on Pokrovsk"
+  GOOD: "EU drafts Article 7 motion"
+  BAD:  "Trump made critical remarks about the Pope at a rally yesterday." (too long)
+  BAD:  "Discussions are ongoing about the situation." (vague)
+
+CRITICAL — facts over emotion: every bullet must convey concrete information (who did what, what happened, what was decided, what changed). Reactions and emotional states are only acceptable when paired with the underlying fact.
+  GOOD pair: "Ukraine/Russia peace talks failed" then "Trump venting on social media"
+  BAD: "Trump frustrated with recent events" (no information, just mood)
+  BAD: "Tensions rising in the region" (vague, no event)
+If a development is purely emotional with no underlying fact, omit it. The same fact-first rule applies to the summary: prefer concrete facts over mood-setting prose.
+
+Bullets must be factual and non-overlapping. Do NOT duplicate content between "bullets" and "newInfo".`
+
+interface LongModeResult {
+  summary: string
+  bullets: string[]
+  newInfo: string[]
+}
+
+function renderLongModeContext(ctx: TopicContext): string {
+  const bulletsList = ctx.topic.bullets && ctx.topic.bullets.length > 0
+    ? ctx.topic.bullets.map((b) => `- ${b}`).join('\n')
+    : '(none yet)'
+  const newInfoList = ctx.topic.newInfo && ctx.topic.newInfo.length > 0
+    ? ctx.topic.newInfo.map((b) => `- ${b}`).join('\n')
+    : '(none yet)'
+  return `Topic: ${ctx.topic.title}
+Background: ${ctx.topic.description}
+
+Current summary: ${ctx.topic.summary ?? '(none yet)'}
+Current bullets:
+${bulletsList}
+Current NEW info (from previous regeneration):
+${newInfoList}
+
+Recent articles (newest first):
+${ctx.articleContext}`
+}
+
+function parseLongModeResult(raw: unknown): LongModeResult | null {
+  if (!raw || typeof raw !== 'object') return null
+  const obj = raw as { summary?: unknown; bullets?: unknown; newInfo?: unknown }
+  const summary = typeof obj.summary === 'string' ? obj.summary.trim() : ''
+  if (!summary) return null
+  const bullets = Array.isArray(obj.bullets)
+    ? obj.bullets.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map((s) => s.trim())
+    : []
+  const newInfo = Array.isArray(obj.newInfo)
+    ? obj.newInfo.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map((s) => s.trim())
+    : []
+  return { summary, bullets, newInfo }
+}
+
+async function regenerateLongMode(ai: InferenceProvider, db: Db, contexts: TopicContext[]): Promise<void> {
+  if (contexts.length === 1) {
+    const ctx = contexts[0]
+    const prompt = `You are a news editor maintaining a running brief for an ongoing situation.
+
+${renderLongModeContext(ctx)}
+
+Produce an updated brief with three fields:
+- "summary": 2-3 sentences capturing the stable overall situation. This is the running context — avoid restating individual events.
+- "bullets": array of bullets (max 8) covering material developments to date, oldest-relevant first. Fold previously-NEW items in here if still relevant; drop ones that have been superseded or are no longer material.
+- "newInfo": array (0-3) of bullets that are materially new since the previous regeneration — i.e. introduced by the latest articles. Empty array if nothing meaningfully new.
+
+${LONG_MODE_STYLE_RULES}
+
+Reply with ONLY JSON: { "summary": "...", "bullets": ["..."], "newInfo": ["..."] }`
+
+    try {
+      const response = await ai.complete(prompt, { reasoningEffort: 'off' })
+      const parsed = parseLongModeResult(JSON.parse(stripCodeFences(response)))
+      if (parsed) {
+        db.news.updateTopicLongForm(ctx.topicId, parsed)
+      } else {
+        console.error(`[consolidator] long-mode regen produced empty/invalid result for topic ${ctx.topicId}`)
+      }
+    } catch (err) {
+      console.error(`[consolidator] failed to regenerate long-mode summary for topic ${ctx.topicId}:`, err)
+    }
+    return
+  }
+
+  const instructionsPrefix = `You are a news editor maintaining running briefs for several ongoing situations.\n\nFor each topic below, produce an updated brief with: a stable 2-3 sentence "summary", a "bullets" array (max 8) of material developments to date oldest-relevant first, and a "newInfo" array (0-3) of bullets that are materially new since the previous regeneration. Empty newInfo array if nothing meaningfully new. Fold previously-NEW items into "bullets" if still relevant; drop superseded ones.\n\n${LONG_MODE_STYLE_RULES}\n\nTopics:\n`
+  const instructionsSuffix = `\n\nReply with a JSON array, one entry per topic, each having "topicId", "summary", "bullets" (array of strings), "newInfo" (array of strings).\n\nExample: [{"topicId": 5, "summary": "...", "bullets": ["..."], "newInfo": ["..."]}, ...]\n\nReply with ONLY the JSON array, no other text.`
+  const fixedOverhead = estimateTokens(instructionsPrefix + instructionsSuffix)
+
+  const renderedContexts = contexts.map((ctx) => `Topic ${ctx.topicId}\n${renderLongModeContext(ctx)}`)
+  const chunks = chunkByTokens(contexts, renderedContexts, inputBudget(ai, fixedOverhead))
+
+  await Promise.all(chunks.map(async (chunk) => {
+    if (chunk.length === 1) {
+      await regenerateLongMode(ai, db, chunk)
+      return
+    }
+
+    const topicList = chunk
+      .map((ctx) => `Topic ${ctx.topicId}\n${renderLongModeContext(ctx)}`)
+      .join('\n\n---\n\n')
+
+    try {
+      const response = await ai.complete(instructionsPrefix + topicList + instructionsSuffix, { reasoningEffort: 'off' })
+      const parsed = JSON.parse(stripCodeFences(response)) as { topicId: number; summary: string; bullets: string[]; newInfo: string[] }[]
+      if (!Array.isArray(parsed)) {
+        console.error('[consolidator] long-mode batch response was not an array, skipping chunk')
+        return
+      }
+      for (const entry of parsed) {
+        const ctx = chunk.find((c) => c.topicId === entry.topicId)
+        if (!ctx) continue
+        const result = parseLongModeResult(entry)
+        if (result) {
+          db.news.updateTopicLongForm(entry.topicId, result)
+        }
+      }
+    } catch {
+      console.error('[consolidator] failed to parse long-mode batch chunk, skipping')
+    }
+  }))
 }
 
 interface ArticleAssessment {

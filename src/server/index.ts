@@ -214,6 +214,8 @@ export async function createServer({ db, aggregator, consolidator, profiler, con
       id: topic.id,
       title: topic.title,
       summary: topic.summary,
+      bullets: topic.bullets,
+      newInfo: topic.newInfo,
       createdAt: topic.createdAt,
       updatedAt: topic.updatedAt,
       isRead,
