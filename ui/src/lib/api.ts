@@ -131,6 +131,13 @@ export async function ungroupArticle(topicId: number, articleId: number): Promis
 export interface Preferences {
   intervalMs: number
   preferenceProfile: string
+  manualPreferences: string
+  preferenceGeneratedAt: number | null
+}
+
+export interface PreferencesUpdate {
+  intervalMs?: number
+  manualPreferences?: string
 }
 
 export async function getPreferences(): Promise<Preferences> {
@@ -139,13 +146,14 @@ export async function getPreferences(): Promise<Preferences> {
   return res.json() as Promise<Preferences>
 }
 
-export async function updatePreferences(prefs: Preferences): Promise<void> {
+export async function updatePreferences(update: PreferencesUpdate): Promise<Preferences> {
   const res = await fetch(`${BASE}/preferences`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify(prefs),
+    body: JSON.stringify(update),
   })
   if (!res.ok) throw new Error((await res.json() as { error: string }).error)
+  return res.json() as Promise<Preferences>
 }
 
 export interface Status {

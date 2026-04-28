@@ -2,6 +2,7 @@
   import { onMount } from 'svelte'
   import { goto } from '$app/navigation'
   import { isLoggedIn, getPreferences, updatePreferences } from '$lib/api'
+  import { timeAgo } from '$lib/time'
 
   const INTERVAL_OPTIONS = [
     { label: '5 minutes', value: 5 * 60 * 1000 },
@@ -13,7 +14,9 @@
   ]
 
   let intervalMs = $state(15 * 60 * 1000)
+  let manualPreferences = $state('')
   let preferenceProfile = $state('')
+  let preferenceGeneratedAt = $state<number | null>(null)
   let loading = $state(true)
   let saving = $state(false)
   let message = $state('')
@@ -26,7 +29,9 @@
     try {
       const prefs = await getPreferences()
       intervalMs = prefs.intervalMs
+      manualPreferences = prefs.manualPreferences ?? ''
       preferenceProfile = prefs.preferenceProfile ?? ''
+      preferenceGeneratedAt = prefs.preferenceGeneratedAt
     } catch (e) {
       message = `Failed to load: ${e}`
     } finally {
@@ -38,7 +43,10 @@
     saving = true
     message = ''
     try {
-      await updatePreferences({ intervalMs, preferenceProfile })
+      const prefs = await updatePreferences({ intervalMs, manualPreferences })
+      manualPreferences = prefs.manualPreferences ?? ''
+      preferenceProfile = prefs.preferenceProfile ?? ''
+      preferenceGeneratedAt = prefs.preferenceGeneratedAt
       message = 'Saved.'
     } catch (e) {
       message = String(e)
@@ -68,18 +76,37 @@
       {/each}
     </select>
 
-    <label for="profile" class="block text-sm font-medium text-stone-700 dark:text-stone-300 mb-2 mt-6">
-      Preference profile
+    <label for="manual" class="block text-sm font-medium text-stone-700 dark:text-stone-300 mb-2 mt-6">
+      Your preferences
     </label>
     <p class="text-xs text-stone-500 dark:text-stone-400 mb-2">
-      Auto-generated from your votes. You can edit this to fine-tune your front page.
+      Tell the system what you want to see. Treated as authoritative — never overwritten.
     </p>
     <textarea
-      id="profile"
-      bind:value={preferenceProfile}
-      rows="10"
+      id="manual"
+      bind:value={manualPreferences}
+      rows="8"
       class="block w-full border border-stone-300 dark:border-stone-700 rounded px-3 py-2 text-sm bg-white dark:bg-stone-800 dark:text-stone-100 font-mono"
-      placeholder="Vote on some articles and your preference profile will be generated automatically..."
+      placeholder="e.g. Lots of climate policy. No celebrity gossip. Prefer EU politics over US."
+    ></textarea>
+
+    <label for="generated" class="block text-sm font-medium text-stone-700 dark:text-stone-300 mb-2 mt-6">
+      Generated profile
+    </label>
+    <p class="text-xs text-stone-500 dark:text-stone-400 mb-2">
+      {#if preferenceGeneratedAt}
+        Inferred from your votes plus the preferences above. Updated {timeAgo(preferenceGeneratedAt)}.
+      {:else}
+        Will be generated after you vote on a few articles or save preferences above.
+      {/if}
+    </p>
+    <textarea
+      id="generated"
+      value={preferenceProfile}
+      readonly
+      rows="10"
+      class="block w-full border border-stone-300 dark:border-stone-700 rounded px-3 py-2 text-sm bg-stone-100 dark:bg-stone-900 dark:text-stone-100 font-mono opacity-70 cursor-not-allowed"
+      placeholder="(empty)"
     ></textarea>
 
     <button
