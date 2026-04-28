@@ -50,12 +50,19 @@ export function createProfiler({ db }: { db: Db }): Profiler {
       `If empty, rely solely on (1).\n\n` +
       `## Articles they liked\n${liked.length > 0 ? formatVotes(liked) : '(none)'}\n\n` +
       `## Articles they disliked\n${disliked.length > 0 ? formatVotes(disliked) : '(none)'}\n\n` +
-      `Write a unified preference profile in markdown that (a) restates and preserves the hard preferences and (b) augments them with inferred interests from voting. ` +
-      `Use second person ("You"). Be specific about the subject areas, not generic. ` +
-      `Keep it under 400 words. Do not include a title heading.`
+      `Write a "preferences program" in markdown with EXACTLY two sections, in this order:\n` +
+      `\n## Follow\n- ...\n- ...\n\n## Skip\n- ...\n- ...\n\n` +
+      `Rules:\n` +
+      `- Output ONLY those two headings and their bullets. No title, no intro, no prose between bullets, no nested bullets, no code fences.\n` +
+      `- Each bullet expresses a CLASS of interest, not a specific instance. Abstract from the voted articles to the underlying theme.\n` +
+      `  - GOOD: "Ukraine war and Russia-NATO escalation", "Shifts of power in European politics", "AI safety and frontier-model policy"\n` +
+      `  - BAD: "The Donbas battle", "Hungarian elections", "GPT-5 launch"\n` +
+      `- Preserve any HARD PREFERENCES verbatim where they fit (the class-level rule applies to vote-inferred bullets, not to user-authored hard rules).\n` +
+      `- Cap each section at ~10 bullets. Drop weaker signals before exceeding.\n` +
+      `- If a section would be empty, write a single bullet "- (none)".`
 
     const profile = await getAi().complete(prompt, {
-      systemPrompt: 'You are a user preference analyst. Write concise, specific preference profiles based on stated preferences and reading behavior.',
+      systemPrompt: 'You are a user preference analyst. You write terse, class-level preference programs as bullet lists — never prose, never instance-level.',
       reasoningEffort: 'high',
     })
 

@@ -91,11 +91,11 @@
     ></textarea>
 
     <label for="generated" class="block text-sm font-medium text-stone-700 dark:text-stone-300 mb-2 mt-6">
-      Generated profile
+      Preferences program
     </label>
     <p class="text-xs text-stone-500 dark:text-stone-400 mb-2">
       {#if preferenceGeneratedAt}
-        Inferred from your votes plus the preferences above. Updated {timeAgo(preferenceGeneratedAt)}.
+        A bullet program (Follow / Skip) inferred from your votes plus the preferences above. Updated {timeAgo(preferenceGeneratedAt)}.
       {:else}
         Will be generated after you vote on a few articles or save preferences above.
       {/if}
