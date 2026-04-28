@@ -83,6 +83,12 @@ export function applySchema(db: DatabaseSync): void {
   if (!userColNames.has('last_viewed_at')) {
     db.exec('ALTER TABLE users ADD COLUMN last_viewed_at INTEGER')
   }
+  // For users that exist before this column was added, any hand-edited content in
+  // preference_profile will be overwritten on the next profiler regeneration.
+  // To preserve it, copy it into manual_preferences via /settings.
+  if (!userColNames.has('manual_preferences')) {
+    db.exec('ALTER TABLE users ADD COLUMN manual_preferences TEXT')
+  }
 
   // Topics summary column
   const topicCols = db.prepare("PRAGMA table_info(topics)").all() as { name: string }[]

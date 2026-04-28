@@ -8,6 +8,7 @@ export interface User {
   intervalMs: number
   preferenceProfile: string | null
   preferenceGeneratedAt: number | null
+  manualPreferences: string | null
   lastViewedAt: number | null
 }
 
@@ -24,6 +25,7 @@ export interface UserDb {
   getUserById(userId: number): User | undefined
   updateUserInterval(userId: number, intervalMs: number): void
   updatePreferenceProfile(userId: number, profile: string): void
+  updateManualPreferences(userId: number, text: string): void
   recordVote(userId: number, articleId: number, vote: 1 | -1 | 0): void
   getVotesByUser(userId: number): { articleId: number; topicId: number; vote: number }[]
   getVotesWithContext(userId: number): { articleTitle: string; topicTitle: string; topicDescription: string; vote: number }[]
@@ -47,6 +49,7 @@ type UserRow = {
   interval_ms: number
   preference_profile: string | null
   preference_generated_at: number | null
+  manual_preferences: string | null
   last_viewed_at: number | null
 }
 
@@ -59,6 +62,7 @@ function mapUserRow(r: UserRow): User {
     intervalMs: r.interval_ms,
     preferenceProfile: r.preference_profile,
     preferenceGeneratedAt: r.preference_generated_at,
+    manualPreferences: r.manual_preferences,
     lastViewedAt: r.last_viewed_at,
   }
 }
@@ -71,12 +75,12 @@ export function createUserDb(db: DatabaseSync): UserDb {
       const result = db
         .prepare('INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)')
         .run(email, passwordHash, now)
-      return { id: Number(result.lastInsertRowid), email, passwordHash, createdAt: now, intervalMs: 15 * 60 * 1000, preferenceProfile: null, preferenceGeneratedAt: null, lastViewedAt: null }
+      return { id: Number(result.lastInsertRowid), email, passwordHash, createdAt: now, intervalMs: 15 * 60 * 1000, preferenceProfile: null, preferenceGeneratedAt: null, manualPreferences: null, lastViewedAt: null }
     },
 
     findUserByEmail(email) {
       const row = db
-        .prepare('SELECT id, email, password_hash, created_at, interval_ms, preference_profile, preference_generated_at, last_viewed_at FROM users WHERE email = ?')
+        .prepare('SELECT id, email, password_hash, created_at, interval_ms, preference_profile, preference_generated_at, manual_preferences, last_viewed_at FROM users WHERE email = ?')
         .get(email) as UserRow | undefined
       if (!row) return undefined
       return mapUserRow(row)
@@ -84,13 +88,13 @@ export function createUserDb(db: DatabaseSync): UserDb {
 
     listAllUsers() {
       return (
-        db.prepare('SELECT id, email, password_hash, created_at, interval_ms, preference_profile, preference_generated_at, last_viewed_at FROM users').all() as UserRow[]
+        db.prepare('SELECT id, email, password_hash, created_at, interval_ms, preference_profile, preference_generated_at, manual_preferences, last_viewed_at FROM users').all() as UserRow[]
       ).map(mapUserRow)
     },
 
     getUserById(userId) {
       const row = db
-        .prepare('SELECT id, email, password_hash, created_at, interval_ms, preference_profile, preference_generated_at, last_viewed_at FROM users WHERE id = ?')
+        .prepare('SELECT id, email, password_hash, created_at, interval_ms, preference_profile, preference_generated_at, manual_preferences, last_viewed_at FROM users WHERE id = ?')
         .get(userId) as UserRow | undefined
       if (!row) return undefined
       return mapUserRow(row)
@@ -102,6 +106,10 @@ export function createUserDb(db: DatabaseSync): UserDb {
 
     updatePreferenceProfile(userId, profile) {
       db.prepare('UPDATE users SET preference_profile = ?, preference_generated_at = ? WHERE id = ?').run(profile, Date.now(), userId)
+    },
+
+    updateManualPreferences(userId, text) {
+      db.prepare('UPDATE users SET manual_preferences = ? WHERE id = ?').run(text, userId)
     },
 
     recordVote(userId, articleId, vote) {

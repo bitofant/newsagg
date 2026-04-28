@@ -169,14 +169,25 @@ export async function createServer({ db, aggregator, consolidator, profiler, con
 
     const user = db.users.getUserById(userId)
     if (!user) return reply.status(404).send({ error: 'user not found' })
-    return { intervalMs: user.intervalMs, preferenceProfile: user.preferenceProfile ?? '' }
+    return {
+      intervalMs: user.intervalMs,
+      preferenceProfile: user.preferenceProfile ?? '',
+      manualPreferences: user.manualPreferences ?? '',
+      preferenceGeneratedAt: user.preferenceGeneratedAt,
+    }
   })
 
   app.patch('/api/preferences', async (req, reply) => {
     const userId = authenticate(req)
     if (!userId) return reply.status(401).send({ error: 'unauthorized' })
 
-    const { intervalMs, preferenceProfile } = req.body as { intervalMs?: number; preferenceProfile?: string }
+    const body = req.body as { intervalMs?: number; manualPreferences?: string; preferenceProfile?: unknown }
+
+    if ('preferenceProfile' in body) {
+      return reply.status(400).send({ error: 'preferenceProfile is no longer editable; use manualPreferences' })
+    }
+
+    const { intervalMs, manualPreferences } = body
 
     if (intervalMs !== undefined) {
       if (typeof intervalMs !== 'number' || intervalMs < 5 * 60 * 1000 || intervalMs > 24 * 60 * 60 * 1000) {
@@ -185,15 +196,21 @@ export async function createServer({ db, aggregator, consolidator, profiler, con
       db.users.updateUserInterval(userId, intervalMs)
     }
 
-    if (preferenceProfile !== undefined) {
-      if (typeof preferenceProfile !== 'string' || preferenceProfile.length > 10000) {
-        return reply.status(400).send({ error: 'preferenceProfile must be a string under 10000 chars' })
+    if (manualPreferences !== undefined) {
+      if (typeof manualPreferences !== 'string' || manualPreferences.length > 10000) {
+        return reply.status(400).send({ error: 'manualPreferences must be a string under 10000 chars' })
       }
-      db.users.updatePreferenceProfile(userId, preferenceProfile)
+      db.users.updateManualPreferences(userId, manualPreferences)
+      profiler.onManualProfileChange(userId)
     }
 
     const user = db.users.getUserById(userId)
-    return { intervalMs: user!.intervalMs, preferenceProfile: user!.preferenceProfile ?? '' }
+    return {
+      intervalMs: user!.intervalMs,
+      preferenceProfile: user!.preferenceProfile ?? '',
+      manualPreferences: user!.manualPreferences ?? '',
+      preferenceGeneratedAt: user!.preferenceGeneratedAt,
+    }
   })
 
   // --- Topics ---
