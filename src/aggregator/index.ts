@@ -31,6 +31,8 @@ export interface Aggregator {
   stop(): void
   /** Returns the latest front page for a user, or null if none generated yet */
   getLatestFrontPage(userId: number): FrontPage | null
+  /** Enqueue a front page generation for a user, bypassing the per-user interval. */
+  requestFrontPage(userId: number): void
   status(): { queueLength: number; activeWorkers: number }
 }
 
@@ -90,12 +92,16 @@ export function createAggregator({
       const signals = db.users.readSignalsInWindow(user.id, FOURTEEN_DAYS_MS)
       if (signals.length === 0) continue
 
-      enqueue(async () => {
-        const page = await generateFrontPage(user.id, signals)
-        db.users.saveFrontPage(user.id, JSON.stringify(page))
-        onFrontPageGenerated?.(user.id, page.generatedAt)
-      })
+      enqueueGeneration(user.id, signals)
     }
+  }
+
+  function enqueueGeneration(userId: number, signals: Signal[]) {
+    enqueue(async () => {
+      const page = await generateFrontPage(userId, signals)
+      db.users.saveFrontPage(userId, JSON.stringify(page))
+      onFrontPageGenerated?.(userId, page.generatedAt)
+    })
   }
 
   function enqueue(task: () => Promise<void>) {
@@ -230,6 +236,10 @@ export function createAggregator({
       const row = db.users.getLatestFrontPage(userId)
       if (!row) return null
       return JSON.parse(row.data) as FrontPage
+    },
+    requestFrontPage(userId) {
+      const signals = db.users.readSignalsInWindow(userId, FOURTEEN_DAYS_MS)
+      enqueueGeneration(userId, signals)
     },
     status() {
       return { queueLength: queue.length, activeWorkers }

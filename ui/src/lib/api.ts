@@ -57,6 +57,11 @@ export async function getFrontPage(): Promise<FrontPage | null> {
   return res.json() as Promise<FrontPage>
 }
 
+export async function requestFrontPage(): Promise<void> {
+  const res = await fetch(`${BASE}/frontpage`, { method: 'POST', headers: authHeaders() })
+  if (!res.ok) throw new Error('Failed to request front page')
+}
+
 export async function setReadTopics(topicIds: number[]): Promise<void> {
   await fetch(`${BASE}/readtopics`, {
     method: 'POST',
