@@ -130,6 +130,17 @@
         </p>
       {/if}
 
+      {#if topic && ((topic.bullets?.length ?? 0) + (topic.newInfo?.length ?? 0) > 0)}
+        <ul class="mt-5 space-y-1.5 list-disc list-inside text-base leading-relaxed text-stone-700 dark:text-stone-300">
+          {#each topic.newInfo ?? [] as item}
+            <li><strong class="text-amber-600 dark:text-amber-400">NEW:</strong> {item}</li>
+          {/each}
+          {#each topic.bullets ?? [] as item}
+            <li>{item}</li>
+          {/each}
+        </ul>
+      {/if}
+
       {#if loading && !snap}
         <p class="text-stone-400 dark:text-stone-500 text-center mt-10">Loading...</p>
       {/if}

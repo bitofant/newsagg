@@ -90,6 +90,15 @@ export function applySchema(db: DatabaseSync): void {
   if (!topicColNames.has('summary')) {
     db.exec('ALTER TABLE topics ADD COLUMN summary TEXT')
   }
+  if (!topicColNames.has('bullets')) {
+    db.exec('ALTER TABLE topics ADD COLUMN bullets TEXT')
+  }
+  if (!topicColNames.has('new_info')) {
+    db.exec('ALTER TABLE topics ADD COLUMN new_info TEXT')
+  }
+  if (!topicColNames.has('substantial_event_timestamps')) {
+    db.exec('ALTER TABLE topics ADD COLUMN substantial_event_timestamps TEXT')
+  }
 
   // Backfill article_topics from legacy articles.topic_id column
   const atCount = (db.prepare('SELECT COUNT(*) as count FROM article_topics').get() as { count: number }).count

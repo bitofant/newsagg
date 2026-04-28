@@ -21,6 +21,8 @@ export interface FrontPageSection {
   topicTitle: string
   headline: string
   summary: string
+  bullets: string[] | null
+  newInfo: string[] | null
   articleIds: number[]
 }
 
@@ -177,6 +179,8 @@ export function createAggregator({
           topicTitle: topic?.title ?? 'Unknown topic',
           headline: topic?.title ?? 'Unknown topic',
           summary,
+          bullets: topic?.bullets ?? null,
+          newInfo: topic?.newInfo ?? null,
           articleIds: sigs.map((s) => s.articleId),
         } satisfies FrontPageSection,
         relevance: 3,
