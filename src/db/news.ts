@@ -293,11 +293,28 @@ export function createNewsDb(db: DatabaseSync): NewsDb {
     },
 
     deleteTopic(id) {
+      // FK = ON and `articles.topic_id` is NOT NULL with REFERENCES topics(id),
+      // so we can't blanket-set it to 0 — that violates the FK.
+      // For each article whose legacy topic_id still points here, look up another linked
+      // topic from article_topics and repoint. Articles with no remaining topic become
+      // truly orphaned and get deleted along with their references.
+      const stragglers = db.prepare('SELECT id FROM articles WHERE topic_id = ?').all(id) as { id: number }[]
+      for (const a of stragglers) {
+        const remaining = db
+          .prepare('SELECT topic_id FROM article_topics WHERE article_id = ? AND topic_id != ? LIMIT 1')
+          .get(a.id, id) as { topic_id: number } | undefined
+        if (remaining) {
+          db.prepare('UPDATE articles SET topic_id = ? WHERE id = ?').run(remaining.topic_id, a.id)
+        } else {
+          db.prepare('DELETE FROM user_votes WHERE article_id = ?').run(a.id)
+          db.prepare('DELETE FROM signal_queue WHERE article_id = ?').run(a.id)
+          db.prepare('DELETE FROM article_topics WHERE article_id = ?').run(a.id)
+          db.prepare('DELETE FROM articles WHERE id = ?').run(a.id)
+        }
+      }
       db.prepare('DELETE FROM signal_queue WHERE topic_id = ?').run(id)
       db.prepare('DELETE FROM user_read_topics WHERE topic_id = ?').run(id)
       db.prepare('DELETE FROM article_topics WHERE topic_id = ?').run(id)
-      // Update legacy topic_id for any articles that still reference this topic
-      db.prepare('UPDATE articles SET topic_id = 0 WHERE topic_id = ?').run(id)
       db.prepare('DELETE FROM topics WHERE id = ?').run(id)
     },
   }

@@ -61,8 +61,14 @@ const LLM_LOG_DIR = './llm'
 /** Per-process monotonic counter so concurrent calls in the same second get unique filenames. */
 let logCallSeq = 0
 
-/** Hard cap on output tokens per chat-completion request. Exported so the consolidator can size prompts against it. */
+/** Hard cap on output tokens per chat-completion request when reasoning is OFF. Exported so the consolidator can size prompts against it. */
 export const MAX_OUTPUT_TOKENS = 4096
+/** Hard cap on output tokens when reasoning is ENABLED — reasoning tokens count against this budget on vLLM (qwen3 parser), so we double it. */
+export const MAX_OUTPUT_TOKENS_REASONING = 8192
+
+function maxOutputFor(opts?: CompleteOptions): number {
+  return opts?.reasoningEffort && opts.reasoningEffort !== 'off' ? MAX_OUTPUT_TOKENS_REASONING : MAX_OUTPUT_TOKENS
+}
 
 export abstract class InferenceProvider {
   protected resolvedModel: string
@@ -112,7 +118,7 @@ export abstract class InferenceProvider {
     const body: Record<string, unknown> = {
       model: this.resolvedModel,
       messages,
-      max_tokens: MAX_OUTPUT_TOKENS,
+      max_tokens: maxOutputFor(opts),
     }
     if (opts?.reasoningEffort === 'off') {
       body['chat_template_kwargs'] = { enable_thinking: false }

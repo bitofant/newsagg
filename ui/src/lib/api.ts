@@ -128,6 +128,29 @@ export async function ungroupArticle(topicId: number, articleId: number): Promis
   return res.json() as Promise<{ newTopicIds: number[] }>
 }
 
+export async function startUnmerge(topicId: number): Promise<{ ok: boolean; alreadyRunning?: boolean }> {
+  const res = await fetch(`${BASE}/topics/${topicId}/unmerge`, {
+    method: 'POST',
+    headers: authHeaders(),
+  })
+  if (!res.ok) throw new Error('Failed to start unmerge')
+  return res.json() as Promise<{ ok: boolean; alreadyRunning?: boolean }>
+}
+
+export interface UnmergeResult {
+  status: 'pending' | 'done' | 'error'
+  newTopics?: { id: number; title: string }[]
+  error?: string
+}
+
+export async function pollUnmergeResult(topicId: number, waitSec = 30): Promise<UnmergeResult> {
+  const res = await fetch(`${BASE}/topics/${topicId}/unmerge-result?wait=${waitSec}`, {
+    headers: authHeaders(),
+  })
+  if (!res.ok) throw new Error('Failed to fetch unmerge result')
+  return res.json() as Promise<UnmergeResult>
+}
+
 export interface Preferences {
   intervalMs: number
   preferenceProfile: string

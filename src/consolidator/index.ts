@@ -1,9 +1,10 @@
 import { getAi, type InferenceProvider } from '../ai/index.js'
-import { MAX_OUTPUT_TOKENS } from '../ai/provider.js'
+import { MAX_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS_REASONING } from '../ai/provider.js'
 import type { ConsolidatorConfig } from '../config.js'
 import type { Db } from '../db/index.js'
 import type { RawArticle } from '../grabber/index.js'
-import type { Topic } from '../db/news.js'
+import type { Article, Topic } from '../db/news.js'
+import type { FrontPage, FrontPageSection } from '../aggregator/index.js'
 
 const TOPIC_PAGE_SIZE = 50
 const ARTICLE_BATCH_SIZE = 10
@@ -22,10 +23,11 @@ function estimateTokens(s: string): number {
 }
 
 /** Tokens available for dynamic prompt content, given the fixed instruction overhead for a call. */
-function inputBudget(ai: InferenceProvider, fixedOverheadTokens: number): number {
+function inputBudget(ai: InferenceProvider, fixedOverheadTokens: number, reasoningEnabled = false): number {
+  const outputReserve = reasoningEnabled ? MAX_OUTPUT_TOKENS_REASONING : MAX_OUTPUT_TOKENS
   return Math.max(
     MIN_INPUT_BUDGET,
-    ai.maxContextTokens - MAX_OUTPUT_TOKENS - fixedOverheadTokens - BUDGET_SAFETY_MARGIN,
+    ai.maxContextTokens - outputReserve - fixedOverheadTokens - BUDGET_SAFETY_MARGIN,
   )
 }
 
@@ -61,6 +63,8 @@ export interface Consolidator {
   enqueue(article: RawArticle): void
   /** Remove an article from a topic and re-classify it against other topics */
   ungroupArticle(articleId: number, topicId: number): Promise<{ newTopicIds: number[] }>
+  /** Split a topic's articles into 2+ new topics via LLM, rewrite affected front pages in place. */
+  unmergeTopic(topicId: number): Promise<{ newTopicIds: number[]; affectedUserIds: number[] }>
   status(): {
     bufferDepth: number
     processing: boolean
@@ -300,9 +304,132 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
     return { newTopicIds }
   }
 
+  async function unmergeTopic(topicId: number): Promise<{ newTopicIds: number[]; affectedUserIds: number[] }> {
+    const oldTopic = db.news.getTopic(topicId)
+    if (!oldTopic) throw new Error(`Topic ${topicId} not found`)
+    const articles = db.news.listArticlesByTopic(topicId)
+    if (articles.length < 2) throw new Error('Cannot unmerge a topic with fewer than 2 articles')
+
+    console.log(`[unmerge] start topic ${topicId} "${oldTopic.title}" (${articles.length} articles)`)
+    const startedAt = Date.now()
+
+    const ai = getAi()
+    const llmStart = Date.now()
+    const groups = await splitTopicViaLlm(ai, oldTopic, articles)
+    console.log(`[unmerge] split (phase 1 + phase 2) returned ${groups.length} groups total in ${Date.now() - llmStart}ms`)
+
+    // Validate + sanitize: keep only valid in-range indices, dedup across groups, then drop empties.
+    const seen = new Set<number>()
+    const sanitized: { title: string; description: string; localIndices: number[] }[] = []
+    for (const g of groups) {
+      const indices = (Array.isArray(g.articleIndices) ? g.articleIndices : [])
+        .filter((i): i is number => typeof i === 'number' && i >= 0 && i < articles.length && !seen.has(i))
+      for (const i of indices) seen.add(i)
+      const title = (g.title ?? '').trim()
+      const description = (g.description ?? '').trim()
+      if (indices.length > 0 && title && description) {
+        sanitized.push({ title, description, localIndices: indices })
+      }
+    }
+    // Assign any unassigned articles to the first group (LLM-omitted entries).
+    if (sanitized.length > 0) {
+      for (let i = 0; i < articles.length; i++) {
+        if (!seen.has(i)) {
+          sanitized[0].localIndices.push(i)
+          seen.add(i)
+        }
+      }
+    }
+    if (sanitized.length < 2) {
+      throw new Error('LLM split did not produce 2+ non-empty groups')
+    }
+    console.log(`[unmerge] after sanitize: ${sanitized.length} groups, sizes=[${sanitized.map((g) => g.localIndices.length).join(', ')}]`)
+
+    // Create new topics, link articles
+    const newTopics: { id: number; title: string; description: string; articleIds: number[] }[] = []
+    for (const g of sanitized) {
+      const articleIds = g.localIndices.map((i) => articles[i].id)
+      const t = db.news.createTopic(g.title, g.description)
+      for (const aid of articleIds) {
+        db.news.linkArticleToTopic(aid, t.id)
+      }
+      newTopics.push({ id: t.id, title: g.title, description: g.description, articleIds })
+    }
+    console.log(`[unmerge] created ${newTopics.length} new topics: ${newTopics.map((t) => `${t.id}="${t.title}"`).join('; ')}`)
+
+    // Generate summaries for new topics with 2+ articles
+    const topicIdsNeedingSummary = newTopics.filter((t) => t.articleIds.length >= 2).map((t) => t.id)
+    if (topicIdsNeedingSummary.length > 0) {
+      const regenStart = Date.now()
+      await regenerateTopicSummaries(ai, db, topicIdsNeedingSummary)
+      console.log(`[unmerge] regenerated summaries for ${topicIdsNeedingSummary.length} topics in ${Date.now() - regenStart}ms`)
+    } else {
+      console.log(`[unmerge] no summaries to regenerate (all new topics single-article)`)
+    }
+
+    // Migrate read state and rewrite affected front pages BEFORE deleting the old topic.
+    db.users.replaceReadTopic(topicId, newTopics.map((t) => t.id))
+
+    // Build the section template for each new topic (re-read to pick up regenerated summary/bullets).
+    const newTopicById = new Map(newTopics.map((t) => [t.id, t] as const))
+    function buildSection(newTopicId: number, originalArticleIds: number[]): FrontPageSection {
+      const fresh = db.news.getTopic(newTopicId)!
+      const meta = newTopicById.get(newTopicId)!
+      const articleIdSet = new Set(meta.articleIds)
+      const carried = originalArticleIds.filter((id) => articleIdSet.has(id))
+      // Fall back to the topic's own article ids if the original section had none in this group.
+      const articleIds = carried.length > 0 ? carried : meta.articleIds
+      const summary = fresh.summary ?? articles.find((a) => articleIdSet.has(a.id))?.text.slice(0, 300) ?? meta.description
+      return {
+        topicId: fresh.id,
+        topicTitle: fresh.title,
+        headline: fresh.title,
+        summary,
+        bullets: fresh.bullets,
+        newInfo: fresh.newInfo,
+        articleIds,
+      }
+    }
+
+    const affectedUserIds: number[] = []
+    for (const user of db.users.listAllUsers()) {
+      const latest = db.users.getLatestFrontPage(user.id)
+      if (!latest) continue
+      let page: FrontPage
+      try {
+        page = JSON.parse(latest.data) as FrontPage
+      } catch {
+        continue
+      }
+      const idx = page.sections.findIndex((s) => s.topicId === topicId)
+      if (idx === -1) continue
+      const originalArticleIds = page.sections[idx].articleIds
+      const replacements = newTopics.map((t) => buildSection(t.id, originalArticleIds))
+      page.sections.splice(idx, 1, ...replacements)
+      page.generatedAt = Date.now()
+      db.users.saveFrontPage(user.id, JSON.stringify(page))
+      affectedUserIds.push(user.id)
+    }
+    console.log(`[unmerge] rewrote front pages for ${affectedUserIds.length} user(s)`)
+
+    // Enqueue new_topic signals so future aggregator runs see the new topics
+    for (const t of newTopics) {
+      if (t.articleIds.length > 0) {
+        db.users.enqueueSignalForAllUsers({ type: 'new_topic', topicId: t.id, articleId: t.articleIds[0] })
+      }
+    }
+
+    // Delete old topic last — this clears its signal queue rows, read-topic rows, and article_topics links
+    db.news.deleteTopic(topicId)
+    console.log(`[unmerge] done topic ${topicId} → [${newTopics.map((t) => t.id).join(', ')}] in ${Date.now() - startedAt}ms`)
+
+    return { newTopicIds: newTopics.map((t) => t.id), affectedUserIds }
+  }
+
   return {
     enqueue,
     ungroupArticle,
+    unmergeTopic,
     status() {
       let estimatedBehindMs: number | null = null
 
@@ -331,6 +458,153 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
   }
 }
 
+interface SplitGroup {
+  title: string
+  description: string
+  articleIndices: number[]
+}
+
+interface IdentifiedTopic {
+  title: string
+  description: string
+}
+
+/**
+ * Two-phase LLM split:
+ *   Phase 1 (reasoning) — read all titles, identify the 2-5 distinct sub-topics.
+ *   Phase 2 (classification, parallelizable) — assign each article to one of those sub-topics.
+ *
+ * Splits the partition decision (small, reasoning-shaped) from the article-by-article assignment
+ * (large, mechanical), keeping each call's prompt + reasoning chain bounded regardless of how
+ * many articles the merged topic contains.
+ */
+async function splitTopicViaLlm(
+  ai: InferenceProvider,
+  topic: Topic,
+  articles: Article[],
+): Promise<SplitGroup[]> {
+  console.log(`[unmerge] phase 1: identifying sub-topics from ${articles.length} article titles`)
+  const phase1Start = Date.now()
+  const identified = await identifyNewTopics(ai, topic, articles)
+  console.log(
+    `[unmerge] phase 1 returned ${identified.length} sub-topic(s) in ${Date.now() - phase1Start}ms: ${identified
+      .map((t) => `"${t.title}"`)
+      .join(', ')}`,
+  )
+  if (identified.length < 2) {
+    throw new Error(`Phase 1 produced ${identified.length} sub-topic(s); need at least 2`)
+  }
+
+  console.log(`[unmerge] phase 2: assigning ${articles.length} articles to ${identified.length} sub-topics`)
+  const phase2Start = Date.now()
+  const assignments = await assignArticlesToTopics(ai, articles, identified)
+  const assignedCount = assignments.filter((a) => a >= 0).length
+  console.log(`[unmerge] phase 2 assigned ${assignedCount}/${articles.length} articles in ${Date.now() - phase2Start}ms`)
+
+  const groups: SplitGroup[] = identified.map((t) => ({
+    title: t.title,
+    description: t.description,
+    articleIndices: [],
+  }))
+  for (let i = 0; i < articles.length; i++) {
+    const idx = assignments[i]
+    if (typeof idx === 'number' && idx >= 0 && idx < groups.length) {
+      groups[idx].articleIndices.push(i)
+    } else {
+      // Unassigned (parse failure or out-of-range) → put in the first group; the downstream
+      // sanitizer will then drop empty groups and flag <2 non-empty as an error.
+      groups[0].articleIndices.push(i)
+    }
+  }
+  return groups
+}
+
+/** Phase 1: read all article titles + the original (incorrect) topic, output sub-topic descriptors (default 2). */
+async function identifyNewTopics(
+  ai: InferenceProvider,
+  topic: Topic,
+  articles: Article[],
+): Promise<IdentifiedTopic[]> {
+  const titleList = articles.map((a, i) => `${i}: ${a.title}`).join('\n')
+  const prompt = `You are a news editor. The articles below were grouped under one topic, but a user has flagged that the merge was incorrect. Figure out the actual sub-topics they should be split into.
+
+Original (incorrect) topic: ${topic.title} — ${topic.description}
+
+Article titles (${articles.length} total):
+${titleList}
+
+CRITICAL: default to EXACTLY 2 sub-topics. The typical wrong-merge looks like one main topic with a smaller unrelated group that got pulled in by accident — expect the split to be very unbalanced (e.g. 50 articles vs 5). Returning 2 is almost always the right answer.
+
+Only return 3 (or at most 4) sub-topics if the articles genuinely cover that many unrelated stories. Do NOT split into more buckets just because you can find different angles, regional variants, or sub-themes of the same story — those belong together. Aspects of one ongoing situation are ONE topic.
+
+For each sub-topic, give a short newspaper-style title and a one-sentence terse description.
+
+Reply with ONLY JSON: { "topics": [{ "title": "...", "description": "..." }, ...] }
+At least 2 entries are required.`
+
+  const response = await ai.complete(prompt, { reasoningEffort: 'high' })
+  const parsed = JSON.parse(stripCodeFences(response)) as { topics?: IdentifiedTopic[] }
+  if (!parsed || !Array.isArray(parsed.topics)) {
+    throw new Error('Phase 1 response missing topics array')
+  }
+  return parsed.topics
+    .map((t) => ({ title: (t.title ?? '').trim(), description: (t.description ?? '').trim() }))
+    .filter((t) => t.title && t.description)
+}
+
+/**
+ * Phase 2: classify each article into one of the identified sub-topics by index.
+ * Token-budget chunked, fans chunks out in parallel via Promise.all. Returns an array of length
+ * `articles.length` where each entry is the chosen topic index, or -1 if assignment failed.
+ */
+async function assignArticlesToTopics(
+  ai: InferenceProvider,
+  articles: Article[],
+  topics: IdentifiedTopic[],
+): Promise<number[]> {
+  const topicOptions = topics.map((t, i) => `${i}: ${t.title} — ${t.description}`).join('\n')
+  const instructionsPrefix = `You are a news editor. Assign each article below to exactly one of these candidate topics by index.\n\nTopics:\n${topicOptions}\n\nArticles:\n`
+  const instructionsSuffix = `\n\nReply with ONLY JSON: { "assignments": [<topicIndex>, <topicIndex>, ...] }\nOutput exactly one topicIndex per article in the order given.`
+  const fixedOverhead = estimateTokens(instructionsPrefix + instructionsSuffix)
+
+  const renderedItems = articles.map((a, i) => `${i}: ${a.title} — ${a.text.slice(0, 200)}`)
+  const indexes = articles.map((_, i) => i)
+  const chunks = chunkByTokens(indexes, renderedItems, inputBudget(ai, fixedOverhead))
+  console.log(`[unmerge] phase 2: ${chunks.length} chunk(s), sizes=[${chunks.map((c) => c.length).join(', ')}]`)
+
+  const assignments: number[] = articles.map(() => -1)
+
+  await Promise.all(
+    chunks.map(async (chunkIndexes) => {
+      const articleList = chunkIndexes
+        .map((origIdx, localIdx) => `${localIdx}: ${articles[origIdx].title} — ${articles[origIdx].text.slice(0, 200)}`)
+        .join('\n')
+
+      const response = await ai.complete(instructionsPrefix + articleList + instructionsSuffix, {
+        reasoningEffort: 'off',
+      })
+
+      try {
+        const parsed = JSON.parse(stripCodeFences(response)) as { assignments?: unknown }
+        if (!Array.isArray(parsed?.assignments)) {
+          console.error('[unmerge] phase 2 chunk: assignments missing or not an array, leaving unassigned')
+          return
+        }
+        for (let i = 0; i < chunkIndexes.length && i < parsed.assignments.length; i++) {
+          const v = parsed.assignments[i]
+          if (typeof v === 'number' && v >= 0 && v < topics.length) {
+            assignments[chunkIndexes[i]] = v
+          }
+        }
+      } catch {
+        console.error('[unmerge] phase 2 chunk: failed to parse response, leaving unassigned')
+      }
+    }),
+  )
+
+  return assignments
+}
+
 interface BatchMatchEntry {
   articleIndex: number
   topics: Topic[]
@@ -353,7 +627,8 @@ async function matchBatchAgainstTopics(
   const fixedOverhead = estimateTokens(instructionsPrefix + instructionsSuffix)
 
   const renderedTopics = topics.map((t) => `${t.id}: ${t.title} — ${t.description}`)
-  const chunks = chunkByTokens(topics, renderedTopics, inputBudget(ai, fixedOverhead))
+  // Matching uses reasoningEffort: 'high' — reserve the larger output budget so chunking accounts for it.
+  const chunks = chunkByTokens(topics, renderedTopics, inputBudget(ai, fixedOverhead, true))
 
   // Fan out chunks in parallel; merge sequentially after.
   const chunkResults = await Promise.all(
