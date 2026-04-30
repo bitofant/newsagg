@@ -1,12 +1,21 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte'
   import { goto } from '$app/navigation'
-  import { isLoggedIn, getFrontPage, vote, subscribeToFrontPage, setReadTopics, getTopicArticles, ungroupArticle, requestFrontPage } from '$lib/api'
+  import { isLoggedIn, getFrontPage, vote, subscribeToFrontPage, setReadTopics, getTopicArticles, ungroupArticle, startUnmerge, pollUnmergeResult, requestFrontPage } from '$lib/api'
   import type { FrontPage, TopicArticle } from '$lib/api'
   import { timeAgo } from '$lib/time'
   import { morphingTopicId, morphSnapshot, frontPageCache } from '$lib/transition'
   import { get } from 'svelte/store'
-  import { ThumbsUp, ThumbsDown, CheckCheck, CircleCheck, Circle, Unlink2, RefreshCw } from 'lucide-svelte'
+  import { ThumbsUp, ThumbsDown, CheckCheck, CircleCheck, Circle, Unlink2, Split, Loader2, RefreshCw } from 'lucide-svelte'
+  import { fade } from 'svelte/transition'
+  import { cubicOut } from 'svelte/easing'
+
+  type UnmergePhase = 'confirm' | 'pending' | 'done' | 'error'
+  interface UnmergeOverlay {
+    phase: UnmergePhase
+    newTopics?: { id: number; title: string }[]
+    error?: string
+  }
 
   let page: FrontPage | null = get(frontPageCache)
   let loading = page === null
@@ -20,7 +29,14 @@
   // until the next page load, letting the user undo or revisit them.
   let hiddenReadTopicIds = new Set<number>(page?.readTopicIds ?? [])
   let ungroupingArticles = new Set<number>()
+  let unmergeOverlays = new Map<number, UnmergeOverlay>()
+  // While any overlay is mid-flow (pending/done/error), hold off SSE-driven page replacements;
+  // the user is looking at the old card and we don't want it to disappear under them.
+  let pendingFreshPage: FrontPage | null = null
   let regenerating = false
+  // topicId → starting height (px) for the unmerge swap-in animation. Populated on dismiss
+  // of a 'done' overlay; consumed by the in: transition on the new cards' first render.
+  let expandingNewCards = new Map<number, number>()
 
   $: sections = page?.sections ?? []
   $: visibleSections = sections.filter(s => !hiddenReadTopicIds.has(s.topicId))
@@ -48,11 +64,11 @@
       try {
         const newPage = await getFrontPage()
         if (newPage) {
-          page = newPage
-          readTopicIds = new Set(newPage.readTopicIds)
-          hiddenReadTopicIds = new Set(newPage.readTopicIds)
-          expandedTopics = new Map()
-          frontPageCache.set(newPage)
+          if (hasBlockingOverlay()) {
+            pendingFreshPage = newPage
+          } else {
+            applyFreshPage(newPage)
+          }
         }
       } catch { /* keep old page */ }
       regenerating = false
@@ -122,6 +138,101 @@
     }
   }
 
+  function setOverlay(topicId: number, state: UnmergeOverlay | null) {
+    if (state === null) unmergeOverlays.delete(topicId)
+    else unmergeOverlays.set(topicId, state)
+    unmergeOverlays = unmergeOverlays
+  }
+
+  function hasBlockingOverlay(): boolean {
+    for (const s of unmergeOverlays.values()) {
+      if (s.phase === 'pending' || s.phase === 'done' || s.phase === 'error') return true
+    }
+    return false
+  }
+
+  function applyFreshPage(p: FrontPage) {
+    page = p
+    readTopicIds = new Set(p.readTopicIds)
+    hiddenReadTopicIds = new Set(p.readTopicIds)
+    expandedTopics = new Map()
+    frontPageCache.set(p)
+  }
+
+  function startUnmergeConfirm(topicId: number) {
+    if (unmergeOverlays.has(topicId)) return
+    setOverlay(topicId, { phase: 'confirm' })
+  }
+
+  function cancelUnmergeConfirm(topicId: number) {
+    setOverlay(topicId, null)
+  }
+
+  async function confirmUnmerge(topicId: number) {
+    setOverlay(topicId, { phase: 'pending' })
+    try {
+      await startUnmerge(topicId)
+    } catch (err) {
+      setOverlay(topicId, { phase: 'error', error: String(err) })
+      return
+    }
+    let networkFails = 0
+    while (true) {
+      try {
+        const r = await pollUnmergeResult(topicId, 30)
+        if (r.status === 'done') {
+          setOverlay(topicId, { phase: 'done', newTopics: r.newTopics ?? [] })
+          return
+        }
+        if (r.status === 'error') {
+          setOverlay(topicId, { phase: 'error', error: r.error ?? 'unmerge failed' })
+          return
+        }
+        networkFails = 0
+      } catch {
+        networkFails++
+        if (networkFails > 5) {
+          setOverlay(topicId, { phase: 'error', error: 'lost connection' })
+          return
+        }
+        await new Promise((r) => setTimeout(r, 2000))
+      }
+    }
+  }
+
+  function dismissOverlay(topicId: number) {
+    const overlay = unmergeOverlays.get(topicId)
+    setOverlay(topicId, null)
+    if (!hasBlockingOverlay() && pendingFreshPage) {
+      if (overlay?.phase === 'done' && overlay.newTopics?.length) {
+        const oldCard = document.querySelector(`[data-topic-id="${topicId}"]`) as HTMLElement | null
+        if (oldCard) {
+          const oldHeight = oldCard.offsetHeight
+          const n = overlay.newTopics.length
+          // Between adjacent cards in the column there's gap-4 + read-line divider + gap-4 ≈ 53px;
+          // shrinking each new card by that share keeps card_{k+1}'s start position unchanged.
+          const perCardStart = Math.max(0, (oldHeight - (n - 1) * 53) / n)
+          const heights = new Map<number, number>()
+          for (const t of overlay.newTopics) heights.set(t.id, perCardStart)
+          expandingNewCards = heights
+        }
+      }
+      applyFreshPage(pendingFreshPage)
+      pendingFreshPage = null
+    }
+  }
+
+  function swapInFromHeight(node: HTMLElement, params: { fromHeight: number | undefined }) {
+    const fromHeight = params.fromHeight
+    if (fromHeight == null || fromHeight <= 0) return { duration: 0 }
+    const target = node.offsetHeight
+    return {
+      duration: 450,
+      easing: cubicOut,
+      css: (t: number) => `height: ${fromHeight + (target - fromHeight) * t}px; overflow: hidden;`
+    }
+  }
+
   async function handleUngroup(topicId: number, articleId: number) {
     ungroupingArticles.add(articleId)
     ungroupingArticles = ungroupingArticles
@@ -170,12 +281,15 @@
     </div>
 
     <div class="flex flex-col gap-4">
-    {#each visibleSections as section, i}
+    {#each visibleSections as section, i (section.topicId)}
       {@const isRead = readTopicIds.has(section.topicId)}
       {@const topicVote = section.articleIds.map(id => votes.get(id)).find(v => v !== undefined)}
       {@const isMorphing = $morphingTopicId === section.topicId}
+      {@const overlay = unmergeOverlays.get(section.topicId)}
       <div
-        class="bg-white dark:bg-stone-900 p-5 rounded-xl shadow-md hover:shadow-lg hover:-translate-y-0.5 transition-all duration-200 {isRead ? 'opacity-50' : ''}"
+        data-topic-id={section.topicId}
+        in:swapInFromHeight={{ fromHeight: expandingNewCards.get(section.topicId) }}
+        class="relative bg-white dark:bg-stone-900 p-5 rounded-xl shadow-md hover:shadow-lg hover:-translate-y-0.5 transition-all duration-200 {isRead && !overlay ? 'opacity-50' : ''}"
         style={isMorphing ? 'view-transition-name: topic-card' : ''}
       >
         <div class="flex gap-3">
@@ -206,6 +320,7 @@
               </ul>
             {/if}
           </a>
+          <!-- TODO: this column is getting crowded; consider an overflow menu once we add another action. -->
           <div class="flex flex-col gap-2 items-center shrink-0 pt-0.5">
             <button
               onclick={() => toggleRead(section.topicId)}
@@ -222,6 +337,14 @@
               class="transition-all hover:scale-110 {topicVote === -1 ? 'text-amber-500 dark:text-amber-400' : 'text-stone-400 dark:text-stone-600'}"
               title="Not interested"
             ><ThumbsDown size={18} /></button>
+            <!-- articleIds counts signals, not articles, so it isn't a reliable article-count signal here.
+                 Always show the button; backend rejects single-article topics. -->
+            <button
+              onclick={() => startUnmergeConfirm(section.topicId)}
+              disabled={!!overlay}
+              class="transition-all hover:scale-110 text-stone-400 dark:text-stone-600 hover:text-amber-500 dark:hover:text-amber-400 disabled:opacity-40 disabled:cursor-not-allowed"
+              title="Split this topic into separate topics"
+            ><Split size={18} /></button>
           </div>
         </div>
 
@@ -266,6 +389,61 @@
             onclick={() => toggleTopic(section.topicId)}
             class="mt-2 text-xs text-stone-400 dark:text-stone-500 hover:text-stone-600 dark:hover:text-stone-300 transition-colors flex items-center gap-1"
           ><span class="transition-transform">▶</span> {section.articleIds.length} source{section.articleIds.length === 1 ? '' : 's'}</button>
+        {/if}
+
+        {#if overlay?.phase === 'confirm'}
+          <div
+            class="absolute inset-0 flex rounded-xl overflow-hidden z-10"
+            transition:fade={{ duration: 150 }}
+          >
+            <button
+              onclick={() => confirmUnmerge(section.topicId)}
+              class="flex-1 bg-green-500/60 hover:bg-green-500/80 flex items-center justify-center transition-colors"
+              aria-label="Confirm unmerge"
+            ><ThumbsUp size={64} class="text-white drop-shadow" /></button>
+            <button
+              onclick={() => cancelUnmergeConfirm(section.topicId)}
+              class="flex-1 bg-red-500/60 hover:bg-red-500/80 flex items-center justify-center transition-colors"
+              aria-label="Cancel"
+            ><ThumbsDown size={64} class="text-white drop-shadow" /></button>
+            <h3 class="absolute top-4 left-0 right-0 text-center font-serif text-xl font-bold text-white drop-shadow-md pointer-events-none">
+              Split topic?
+            </h3>
+          </div>
+        {:else if overlay?.phase === 'pending'}
+          <div
+            class="absolute inset-0 bg-yellow-400/70 rounded-xl flex flex-col items-center justify-center z-10"
+            transition:fade={{ duration: 150 }}
+          >
+            <h3 class="font-serif text-xl font-bold text-white drop-shadow-md mb-3">Splitting topic…</h3>
+            <Loader2 size={56} class="animate-spin text-white drop-shadow" />
+          </div>
+        {:else if overlay?.phase === 'done'}
+          <button
+            onclick={() => dismissOverlay(section.topicId)}
+            class="absolute inset-0 bg-green-500/75 rounded-xl flex flex-col items-center justify-center z-10 px-5 py-6 cursor-pointer"
+            transition:fade={{ duration: 150 }}
+            aria-label="Dismiss"
+          >
+            <h3 class="font-serif text-xl font-bold text-white drop-shadow-md mb-3">Split into:</h3>
+            <ul class="space-y-1.5 text-white text-base font-medium text-center max-w-full">
+              {#each overlay.newTopics ?? [] as nt}
+                <li class="leading-snug">{nt.title}</li>
+              {/each}
+            </ul>
+            <p class="absolute bottom-2 left-0 right-0 text-center text-[10px] uppercase tracking-widest text-white/80">Tap to dismiss</p>
+          </button>
+        {:else if overlay?.phase === 'error'}
+          <button
+            onclick={() => dismissOverlay(section.topicId)}
+            class="absolute inset-0 bg-red-500/75 rounded-xl flex flex-col items-center justify-center z-10 px-5 py-6 cursor-pointer"
+            transition:fade={{ duration: 150 }}
+            aria-label="Dismiss"
+          >
+            <h3 class="font-serif text-xl font-bold text-white drop-shadow-md mb-1">Split failed</h3>
+            <p class="text-white text-sm">{overlay.error ?? 'unknown error'}</p>
+            <p class="absolute bottom-2 left-0 right-0 text-center text-[10px] uppercase tracking-widest text-white/80">Tap to dismiss</p>
+          </button>
         {/if}
       </div>
 

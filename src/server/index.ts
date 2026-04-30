@@ -275,6 +275,123 @@ export async function createServer({ db, aggregator, consolidator, profiler, con
     }
   })
 
+  // Unmerge runs async on the server: POST kicks off the work, GET .../unmerge-result polls
+  // (with optional `wait` for long-poll). Job state lives in-memory; entries TTL after 5 min.
+  interface UnmergeJob {
+    status: 'pending' | 'done' | 'error'
+    newTopics: { id: number; title: string }[]
+    error?: string
+    startedAt: number
+    completedAt?: number
+  }
+  const unmergeJobs = new Map<number, UnmergeJob>()
+  const unmergeWaiters = new Map<number, Set<(j: UnmergeJob) => void>>()
+  const UNMERGE_RESULT_TTL_MS = 5 * 60 * 1000
+  setInterval(() => {
+    const cutoff = Date.now() - UNMERGE_RESULT_TTL_MS
+    for (const [tid, j] of unmergeJobs) {
+      if (j.status !== 'pending' && (j.completedAt ?? 0) < cutoff) {
+        unmergeJobs.delete(tid)
+      }
+    }
+  }, 60_000)
+
+  function flushUnmergeWaiters(topicId: number) {
+    const job = unmergeJobs.get(topicId)
+    const waiters = unmergeWaiters.get(topicId)
+    if (!job || !waiters) return
+    for (const w of waiters) w(job)
+    unmergeWaiters.delete(topicId)
+  }
+
+  app.post('/api/topics/:topicId/unmerge', async (req, reply) => {
+    const callerId = authenticate(req)
+    if (!callerId) return reply.status(401).send({ error: 'unauthorized' })
+
+    const topicId = parseInt((req.params as { topicId: string }).topicId, 10)
+    if (isNaN(topicId)) return reply.status(400).send({ error: 'invalid topicId' })
+
+    const existing = unmergeJobs.get(topicId)
+    if (existing && existing.status === 'pending') {
+      return { ok: true, alreadyRunning: true }
+    }
+
+    const job: UnmergeJob = { status: 'pending', newTopics: [], startedAt: Date.now() }
+    unmergeJobs.set(topicId, job)
+
+    void (async () => {
+      try {
+        const { newTopicIds, affectedUserIds } = await consolidator.unmergeTopic(topicId)
+        const newTopics = newTopicIds.map((id) => {
+          const t = db.news.getTopic(id)
+          return { id, title: t?.title ?? '?' }
+        })
+        unmergeJobs.set(topicId, {
+          status: 'done',
+          newTopics,
+          startedAt: job.startedAt,
+          completedAt: Date.now(),
+        })
+        flushUnmergeWaiters(topicId)
+        const generatedAt = Date.now()
+        for (const userId of affectedUserIds) notifyUser(userId, generatedAt)
+      } catch (err) {
+        app.log.error(err, 'unmerge failed')
+        unmergeJobs.set(topicId, {
+          status: 'error',
+          newTopics: [],
+          error: 'unmerge failed',
+          startedAt: job.startedAt,
+          completedAt: Date.now(),
+        })
+        flushUnmergeWaiters(topicId)
+      }
+    })()
+
+    return { ok: true }
+  })
+
+  app.get('/api/topics/:topicId/unmerge-result', async (req, reply) => {
+    const callerId = authenticate(req)
+    if (!callerId) return reply.status(401).send({ error: 'unauthorized' })
+
+    const topicId = parseInt((req.params as { topicId: string }).topicId, 10)
+    if (isNaN(topicId)) return reply.status(400).send({ error: 'invalid topicId' })
+
+    const job = unmergeJobs.get(topicId)
+    if (!job) return reply.status(404).send({ error: 'no unmerge job for this topic' })
+
+    if (job.status !== 'pending') {
+      return { status: job.status, newTopics: job.newTopics, error: job.error }
+    }
+
+    const waitParam = (req.query as Record<string, string>).wait
+    const waitSec = waitParam ? Math.max(0, Math.min(parseInt(waitParam, 10) || 0, 60)) : 0
+    if (waitSec === 0) return { status: 'pending' as const }
+
+    return await new Promise<unknown>((resolve) => {
+      let settled = false
+      const settle = (v: unknown) => {
+        if (settled) return
+        settled = true
+        resolve(v)
+      }
+      let timer: ReturnType<typeof setTimeout> | null = null
+      const notify = (j: UnmergeJob) => {
+        if (timer) clearTimeout(timer)
+        settle({ status: j.status, newTopics: j.newTopics, error: j.error })
+      }
+      timer = setTimeout(() => {
+        unmergeWaiters.get(topicId)?.delete(notify)
+        settle({ status: 'pending' as const })
+      }, waitSec * 1000)
+
+      const set = unmergeWaiters.get(topicId) ?? new Set()
+      set.add(notify)
+      unmergeWaiters.set(topicId, set)
+    })
+  })
+
   // --- SSE: real-time front page push ---
 
   app.get('/api/events', async (req, reply) => {

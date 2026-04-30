@@ -35,6 +35,8 @@ export interface UserDb {
   setReadTopics(userId: number, topicIds: number[]): void
   setTopicRead(userId: number, topicId: number, read: boolean): void
   unreadTopicForNonDownvoters(topicId: number): void
+  /** For every user that had `oldTopicId` marked as read, mark each of `newTopicIds` as read with the same `read_at`. */
+  replaceReadTopic(oldTopicId: number, newTopicIds: number[]): void
   cleanupOldSignals(maxAgeMs: number): void
   saveFrontPage(userId: number, data: string): void
   getLatestFrontPage(userId: number): { generatedAt: number; data: string } | undefined
@@ -209,6 +211,29 @@ export function createUserDb(db: DatabaseSync): UserDb {
         ).run(userId, topicId, Date.now())
       } else {
         db.prepare('DELETE FROM user_read_topics WHERE user_id = ? AND topic_id = ?').run(userId, topicId)
+      }
+    },
+
+    replaceReadTopic(oldTopicId, newTopicIds) {
+      if (newTopicIds.length === 0) return
+      const rows = db
+        .prepare('SELECT user_id, read_at FROM user_read_topics WHERE topic_id = ?')
+        .all(oldTopicId) as { user_id: number; read_at: number }[]
+      if (rows.length === 0) return
+      const insert = db.prepare(
+        'INSERT OR REPLACE INTO user_read_topics (user_id, topic_id, read_at) VALUES (?, ?, ?)',
+      )
+      db.exec('BEGIN')
+      try {
+        for (const row of rows) {
+          for (const newId of newTopicIds) {
+            insert.run(row.user_id, newId, row.read_at)
+          }
+        }
+        db.exec('COMMIT')
+      } catch (e) {
+        db.exec('ROLLBACK')
+        throw e
       }
     },
 
