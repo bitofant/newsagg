@@ -1,0 +1,82 @@
+# Consolidator (`src/consolidator/`)
+
+Topic matching, signal generation, summary generation, ungroup/unmerge. The heaviest LLM-using component.
+
+## Drain cycle
+
+- Internal async queue: `enqueue()` dedups against an in-memory pending set + DB (`articleExistsByUrl`) and buffers articles. Drain loop runs every 5s, serialized via the `processing` flag.
+- Batches up to 10 articles, matches against topics in pages of 50 (newest first). All articles are checked against every topic page (not pruned after a match), accumulating topic matches across pages — necessary because a multi-subject article may match topics on different pages.
+- Multi-topic matching: an article can match multiple existing topics (e.g. a roundup article covering several subjects).
+- Creates new topics (for unmatched articles) or appends to existing ones.
+- Enqueues signals to all users: `new_topic`, `added_to_topic`, `substantial_new_info`, `concluded_issue`.
+- Combined LLM assessment: substantiality + conclusion detection in one call with topic context.
+
+## Batched + parallel LLM dispatch
+
+Inside one drain cycle, independent LLM calls fan out via `Promise.all`. The drain itself remains serialized.
+
+- **Batched calls**: assessments (all article-topic pairs), new-topic summaries (all unmatched articles), summary regenerations (all topics needing one) each collapse into a single batched LLM call (or N chunked calls if token-budgeted) with a single-item fast path.
+- **Token-budgeted chunking**: every batched call estimates tokens (~4 chars/token) against `ai.maxContextTokens - MAX_OUTPUT_TOKENS - overhead - safety_margin`, accumulates greedily, fires when budget is hit. If a chunk ends up with one item, the function's single-item fast path is used.
+- **Parallel dispatch**: paginated topic-matching pages, token-budget chunks within each batched function, and phase-4 (regen existing summaries) + phase-5 (new-topic summaries) all run concurrently.
+
+Sized for vLLM's continuous batching, where concurrent requests share GPU time efficiently.
+
+## Topic summaries
+
+- **Short mode** (default): 2-3 sentence prose summary in `topics.summary`. Generated when a topic reaches 2+ articles; regenerated when `substantial_new_info` is detected.
+- **Long mode** (threshold-gated): each topic tracks `substantial_event_timestamps` (one append per `substantial_new_info`). When `length >= BULLETS_THRESHOLD` (currently 2), regeneration switches to a structured `{ summary, bullets, newInfo }` JSON shape (one LLM call, written via `updateTopicLongForm`). Within a single drain cycle, short-mode and long-mode batches dispatch in parallel via `Promise.all`, each with its own token-budgeted chunking.
+- Bullet style is enforced in the prompt: terse half-sentence headlines (3-7 words, e.g. "Trump insults Pope"), facts over emotion (no mood-only bullets — "Trump frustrated with recent events" is rejected; reactions only acceptable when paired with the underlying fact).
+- The single-item wrappers (`regenerateTopicSummary`, `generateTopicSummary`) are kept only for `ungroupArticle`, where batching doesn't apply.
+
+## Read-state reset on substantial news
+
+When `substantial_new_info` is detected, the topic's read flag is removed for all users **except** those who downvoted (thumbs down) an article in that topic — ensures users see important developments even if they previously marked the topic as read.
+
+## Article ungrouping
+
+`ungroupArticle(articleId, topicId)` removes an article from a topic and re-classifies it via the same paginated LLM matching (excluding the source topic). Falls back to creating a new standalone topic if no match found. Cleans up empty topics.
+
+## Topic unmerging
+
+`unmergeTopic(topicId)` splits a wrongly-merged topic via a two-phase LLM call:
+
+1. **Phase 1** (`identifyNewTopics`, `reasoningEffort: 'high'`, one call) reads all article titles + the original topic and outputs sub-topic descriptors (default 2, capped at 4). Prompt biases hard toward 2 — typical wrong-merge is "one big topic + a small off-topic group that snuck in".
+2. **Phase 2** (`assignArticlesToTopics`, `reasoningEffort: 'off'`, parallel via `Promise.all`) chunks articles by token budget and assigns each to a phase-1 sub-topic by index.
+
+Then: new topics are created, summaries regenerated, read state is copied from the old topic to all new topics (per-user via `db.users.replaceReadTopic`), and every user's latest front page that referenced the old topic is rewritten in place (section spliced out, new sections spliced in at the same index, saved as a new `front_pages` row so SSE pushes the update). The old topic is deleted last. Returns `{ newTopicIds, affectedUserIds }`.
+
+The HTTP layer wraps this asynchronously: `POST /api/topics/:id/unmerge` kicks off the work and returns immediately; `GET /api/topics/:id/unmerge-result?wait=N` long-polls (up to 60s, server-clamped) and returns `{ status: 'pending' | 'done' | 'error', newTopics?, error? }`. Job state lives in an in-memory `Map<topicId, UnmergeJob>` in the server with a 5-minute TTL.
+
+## Status
+
+Each drain records `{startedAt, endedAt, articleCount}` in a rolling window (size `consolidator.statusWindowMs`), surfaced via `status()` as `estimatedBehindMs` (buffer depth × avg ms/article). LLM busy % is tracked separately in `src/ai/`, not here, because other components also consume LLM time.
+
+## Planned
+
+- **Embedding-based pre-filter** (`src/consolidator/index.ts:18`) — fast vector similarity step to narrow candidate topics before the LLM matching call.
+
+## Design decisions
+
+### Batched paginated topic matching (2026-04-07, updated 2026-04-14)
+The consolidator matches up to 10 articles at a time against topics in pages of 50, ordered by `created_at DESC` (newest first). All articles are checked against every topic page (not pruned after a match), accumulating topic matches across pages — necessary because a multi-subject article may match topics on different pages. Articles with no matches after all pages get new topics. Keeps prompt size bounded regardless of how many topics accumulate.
+
+### Persistent topic summaries over per-generation LLM headlines (2026-04-13)
+Instead of generating headlines and summaries via LLM at front-page time (feasible for 8 sections but not for 100), topic summaries are generated once by the consolidator and stored in `topics.summary`. Created when a topic reaches 2+ articles; regenerated on `substantial_new_info`. Single-article topics use the article's own text. The aggregator uses `topic.title` as the headline. Rationale: decouples summary quality from front-page generation speed; avoids 10+ sequential LLM calls per front page.
+
+### Consolidator collapses LLM work into batched calls per drain cycle (2026-04-16)
+After matching, the consolidator issues at most one LLM call each for (a) assessing all article-topic pairs, (b) generating topic summaries for all unmatched articles, (c) regenerating summaries for all topics that need it. Previously these ran one call per item, which backed up Ollama during heavy drain cycles (e.g. 20 sequential assess calls for 10 articles matching 2 topics each). Each batched function has a single-item fast path with the original prompt; multi-item paths return JSON arrays/objects keyed by index/topicId. Rationale: Ollama is the throughput bottleneck — fewer, larger prompts amortize request overhead. Do NOT revert to per-item calls for simplicity; the per-item versions are kept only as wrappers used by `ungroupArticle` where batching doesn't apply.
+
+### Token-budgeted chunking for batched LLM calls (2026-04-16)
+Every batched consolidator call (`matchBatchAgainstTopics`, `assessArticleBatch`, `generateTopicSummaries`, `regenerateTopicSummaries`) rejects fixed chunk sizes in favor of a rough token estimate (`~4 chars/token`) against `ai.maxContextTokens - MAX_OUTPUT_TOKENS - overhead - safety_margin`. Items accumulated greedily until budget is hit, then chunk fires and a new one starts. If a chunk ends up with a single item, execution falls through to the function's single-item fast path. Rationale: hardcoded `TOPIC_PAGE_SIZE = 50` and unbounded per-batch pair counts could silently overflow small-context models, causing truncation or empty responses. `maxContextTokens` is now the single knob that controls safe prompt sizing. The estimate is deliberately rough — failure mode of over-estimating is an extra LLM call, not a rejected request.
+
+### Parallel LLM dispatch inside a consolidator drain (2026-04-26)
+Independent LLM calls inside a drain fan out via `Promise.all`: paginated topic-matching pages, token-budget chunks within each batched function, and phase 4 (regen existing summaries) + phase 5 (new-topic summaries). The drain itself remains serialized via the `processing` flag — only the LLM-bound work inside one drain runs concurrently. Rationale: with vLLM's continuous batching, concurrent requests share GPU time efficiently, so serial pacing leaves throughput on the table. Complements (does not replace) the batching decision above: batching keeps each request large; parallel dispatch keeps the GPU busy across the requests that remain. Side effect: LLM log filenames now include a per-process sequence suffix so concurrent calls in the same second don't overwrite each other's `.req`/`.res`/`.think` files.
+
+### Threshold-gated long-form topic summaries (2026-04-27)
+Long-running stories (e.g. the Ukraine war) accumulate dozens of articles, and a single 2-3 sentence prose summary becomes the wrong shape — either an unreadable wall as the model crams everything in, or so general that meaningful new developments disappear. Solution: each topic tracks `substantial_event_timestamps` (one append per `substantial_new_info` event) and switches to structured `{ summary, bullets, newInfo }` once the count crosses `BULLETS_THRESHOLD` (currently 2). Below threshold, prose-only behavior is unchanged. The long-mode prompt mandates ticker-style half-sentence bullets ("Trump insults Pope", 3-7 words) and rejects emotion-only content ("Trump frustrated with recent events" is a stated BAD example) — reactions only acceptable when paired with the underlying fact. The full state regenerates on every substantial event; the LLM is responsible for folding previously-NEW items into bullets, dropping superseded items, flagging the actually-new ones in `newInfo`. Timestamps stored as a JSON array (rather than a bare counter) so the same column gives recency for free, useful for surfacing "last update X ago". UI renders newInfo first with an amber "NEW:" prefix, then bullets, on both card and detail views. Rationale: the cheapest change that fixes the wall-of-text failure mode while keeping the writer-side prompt simple and giving the reader an at-a-glance "what changed".
+
+### Topic unmerging rewrites front pages in place (2026-04-28)
+When the user splits a wrongly-merged topic, `consolidator.unmergeTopic` doesn't just delete the old topic and let the next aggregator tick rebuild — it actively rewrites every user's latest front page, splicing the old section out and the N new sections in at the same index, then saves a new `front_pages` row so SSE pushes the update. Rationale: unmerge is a user-triggered correction; making the user wait up to `intervalMs` (default 15 minutes) for the front page to "look right" feels broken, especially right after the user has confirmed a destructive action. The cost is one parse + splice + INSERT per user with a section referencing that topic — cheap. Read state is also actively migrated (`db.users.replaceReadTopic`) so a user who had marked the merged topic as read sees the new topics under the read line, not surfacing as fresh unread. New `new_topic` signals are still enqueued for all users so future aggregator runs see the new topics naturally; the front-page rewrite is purely an immediate-feedback optimization on top.
+
+### Two-phase unmerge split (2026-04-29)
+The single-shot "partition all articles in one reasoning call" approach (in `splitTopicViaLlm`) timed out repeatedly on real wrongly-merged topics with 60-85 articles — the reasoning chain has to weigh every article against every potential grouping, the chain alone exhausts the 8k output budget before any JSON appears, and the call hits the 5-minute `requestTimeoutMs`. Solution: split the work. **Phase 1** (`identifyNewTopics`, `reasoningEffort: 'high'`) reads only the article titles plus the original (incorrect) topic and outputs sub-topic `{ title, description }` entries — defaulting to 2, capped at 4. The reasoning chain is bounded by "decide the structure" rather than "structure + place every article". **Phase 2** (`assignArticlesToTopics`, `reasoningEffort: 'off'`, parallel via `Promise.all`) takes that small list of candidate topics + chunks the articles by token budget and asks the LLM to classify each article by index — pure mechanical assignment, chunks fan out concurrently. Each chunk's failure mode is "leaves articles unassigned"; the wrapper puts unassigned articles in group 0 so the existing sanitizer can drop empty groups and surface "produced <2 non-empty" if classification went badly. **Phase 1 prompt biases hard toward returning 2 sub-topics**, with explicit instructions that the typical wrong-merge is "one large topic + a small off-topic group that snuck in" and that aspects/sub-themes of the same ongoing story are ONE topic. Without this bias the model fans out into 5-6 buckets even for clearly-2-way splits (a user reported clicking unmerge expecting 2 topics and getting 6). Rejected alternatives: (a) refuse unmerges above N articles (papers over the actual problem and is user-hostile for exactly the cases that need fixing); (b) drop reasoning entirely on the partition decision (the structure-finding step genuinely is reasoning-shaped — without it Qwen3.6 produced incoherent groups in early experiments).
