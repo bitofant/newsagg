@@ -97,6 +97,8 @@ export interface NewsDb {
   updateTopicLongForm(topicId: number, fields: { summary: string; bullets: string[]; newInfo: string[] }): void
   /** Append a substantial-event timestamp to the topic and return the updated array. */
   appendSubstantialEventTimestamp(topicId: number, ts: number): number[]
+  /** Replace the substantial-event timestamp array on the topic. Used by mergeTopic to combine two topics' history. */
+  setSubstantialEventTimestamps(topicId: number, ts: number[]): void
   getArticleCountByTopic(topicId: number): number
   getArticleById(id: number): Article | undefined
   unlinkArticleFromTopic(articleId: number, topicId: number): void
@@ -259,6 +261,10 @@ export function createNewsDb(db: DatabaseSync): NewsDb {
       const updated = [...current, ts]
       db.prepare('UPDATE topics SET substantial_event_timestamps = ? WHERE id = ?').run(JSON.stringify(updated), topicId)
       return updated
+    },
+
+    setSubstantialEventTimestamps(topicId, ts) {
+      db.prepare('UPDATE topics SET substantial_event_timestamps = ? WHERE id = ?').run(JSON.stringify(ts), topicId)
     },
 
     getArticleCountByTopic(topicId) {

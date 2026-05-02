@@ -65,9 +65,14 @@ export interface Consolidator {
   ungroupArticle(articleId: number, topicId: number): Promise<{ newTopicIds: number[] }>
   /** Split a topic's articles into 2+ new topics via LLM, rewrite affected front pages in place. */
   unmergeTopic(topicId: number): Promise<{ newTopicIds: number[]; affectedUserIds: number[] }>
+  /** Merge `loserId` into `winnerId`: rewire articles, rewrite affected front pages, enqueue summary regen, delete loser. */
+  mergeTopic(loserId: number, winnerId: number): Promise<{ winnerId: number; affectedUserIds: number[] }>
+  /** Queue a topic for background summary regeneration on the next drain. Deduped via a Set. */
+  enqueueRegen(topicId: number): void
   status(): {
     bufferDepth: number
     processing: boolean
+    pendingRegens: number
     estimatedBehindMs: number | null
   }
   start(): void
@@ -79,6 +84,7 @@ export interface Consolidator {
 export function createConsolidator({ db, config }: { db: Db; config: ConsolidatorConfig }): Consolidator {
   const buffer: RawArticle[] = []
   const pendingUrls = new Set<string>()
+  const pendingRegenTopicIds = new Set<number>()
   let timer: ReturnType<typeof setInterval> | null = null
   let processing = false
   const batchHistory: { startedAt: number; endedAt: number; articleCount: number }[] = []
@@ -91,27 +97,46 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
     pendingUrls.add(article.url)
   }
 
+  function enqueueRegen(topicId: number) {
+    pendingRegenTopicIds.add(topicId)
+  }
+
   async function drain() {
-    if (processing || buffer.length === 0) return
+    if (processing) return
+    if (buffer.length === 0 && pendingRegenTopicIds.size === 0) return
     processing = true
     try {
-      // Take up to ARTICLE_BATCH_SIZE from the buffer
-      const batch = buffer.splice(0, ARTICLE_BATCH_SIZE)
-      for (const a of batch) pendingUrls.delete(a.url)
+      if (buffer.length > 0) {
+        const batch = buffer.splice(0, ARTICLE_BATCH_SIZE)
+        for (const a of batch) pendingUrls.delete(a.url)
 
-      // Safety net: filter out anything that landed in DB between enqueue and drain
-      const fresh = batch.filter((a) => !db.news.articleExistsByUrl(a.url))
-      if (fresh.length === 0) return
+        // Safety net: filter out anything that landed in DB between enqueue and drain
+        const fresh = batch.filter((a) => !db.news.articleExistsByUrl(a.url))
+        if (fresh.length > 0) {
+          const ai = getAi()
+          const startedAt = Date.now()
+          await processBatch(ai, fresh)
+          const endedAt = Date.now()
 
-      const ai = getAi()
-      const startedAt = Date.now()
-      await processBatch(ai, fresh)
-      const endedAt = Date.now()
+          batchHistory.push({ startedAt, endedAt, articleCount: fresh.length })
+          const cutoff = endedAt - config.statusWindowMs
+          while (batchHistory.length > 0 && batchHistory[0].endedAt < cutoff) {
+            batchHistory.shift()
+          }
+        }
+      }
 
-      batchHistory.push({ startedAt, endedAt, articleCount: fresh.length })
-      const cutoff = endedAt - config.statusWindowMs
-      while (batchHistory.length > 0 && batchHistory[0].endedAt < cutoff) {
-        batchHistory.shift()
+      if (pendingRegenTopicIds.size > 0) {
+        const ids = [...pendingRegenTopicIds]
+        pendingRegenTopicIds.clear()
+        try {
+          const ai = getAi()
+          const startedAt = Date.now()
+          await regenerateTopicSummaries(ai, db, ids)
+          console.log(`[consolidator] background regen for ${ids.length} topic(s) in ${Date.now() - startedAt}ms`)
+        } catch (err) {
+          console.error('[consolidator] background regen error:', err)
+        }
       }
     } catch (err) {
       console.error('[consolidator] batch processing error:', err)
@@ -426,10 +451,102 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
     return { newTopicIds: newTopics.map((t) => t.id), affectedUserIds }
   }
 
+  async function mergeTopic(loserId: number, winnerId: number): Promise<{ winnerId: number; affectedUserIds: number[] }> {
+    if (loserId === winnerId) throw new Error('Cannot merge a topic with itself')
+    const loser = db.news.getTopic(loserId)
+    if (!loser) throw new Error(`Topic ${loserId} not found`)
+    const winner = db.news.getTopic(winnerId)
+    if (!winner) throw new Error(`Topic ${winnerId} not found`)
+
+    const loserArticles = db.news.listArticlesByTopic(loserId)
+    console.log(`[merge] start: ${loserId} "${loser.title}" (${loserArticles.length} articles) → ${winnerId} "${winner.title}"`)
+    const startedAt = Date.now()
+
+    // 1. Rewire article links onto winner (idempotent for articles already in both topics)
+    for (const a of loserArticles) {
+      db.news.linkArticleToTopic(a.id, winnerId)
+    }
+
+    // 2. Combine substantial-event timestamps so the threshold-gated long-form mode reflects total history
+    const combinedTs = [...winner.substantialEventTimestamps, ...loser.substantialEventTimestamps].sort((a, b) => a - b)
+    db.news.setSubstantialEventTimestamps(winnerId, combinedTs)
+    db.news.updateTopicTimestamp(winnerId)
+
+    // 3. Read-state union: if a user had loser read, treat winner as read too (don't resurface)
+    db.users.unionReadTopic(loserId, winnerId)
+
+    // 4. Queue summary regen for the next drain rather than blocking the request — long-mode regen
+    //    on a freshly-merged 30+ article topic can take minutes and HTTP/proxy clients time out.
+    //    The aggregator will pick up the fresh summary on its next per-user tick; in the meantime
+    //    the front-page rewrite below uses the winner's current (pre-merge) summary.
+    if (loserArticles.length > 0) {
+      enqueueRegen(winnerId)
+    }
+
+    // 5. Rewrite affected front pages in place. If a user's page has only the loser section,
+    //    swap in a fresh winner section at the same index. If both are present, drop the loser
+    //    section and merge its articleIds into the winner section so nothing is lost.
+    const fresh = db.news.getTopic(winnerId)!
+    const affectedUserIds: number[] = []
+    for (const user of db.users.listAllUsers()) {
+      const latest = db.users.getLatestFrontPage(user.id)
+      if (!latest) continue
+      let page: FrontPage
+      try {
+        page = JSON.parse(latest.data) as FrontPage
+      } catch {
+        continue
+      }
+      const loserIdx = page.sections.findIndex((s) => s.topicId === loserId)
+      if (loserIdx === -1) continue
+      const loserSection = page.sections[loserIdx]
+      const winnerIdx = page.sections.findIndex((s) => s.topicId === winnerId)
+
+      if (winnerIdx === -1) {
+        const newSection: FrontPageSection = {
+          topicId: fresh.id,
+          topicTitle: fresh.title,
+          headline: fresh.title,
+          summary: fresh.summary ?? loserSection.summary,
+          bullets: fresh.bullets,
+          newInfo: fresh.newInfo,
+          articleIds: loserSection.articleIds,
+        }
+        page.sections.splice(loserIdx, 1, newSection)
+      } else {
+        const winnerSection = page.sections[winnerIdx]
+        const merged = Array.from(new Set([...winnerSection.articleIds, ...loserSection.articleIds]))
+        page.sections[winnerIdx] = {
+          ...winnerSection,
+          topicTitle: fresh.title,
+          headline: fresh.title,
+          summary: fresh.summary ?? winnerSection.summary,
+          bullets: fresh.bullets,
+          newInfo: fresh.newInfo,
+          articleIds: merged,
+        }
+        page.sections.splice(loserIdx, 1)
+      }
+      page.generatedAt = Date.now()
+      db.users.saveFrontPage(user.id, JSON.stringify(page))
+      affectedUserIds.push(user.id)
+    }
+    console.log(`[merge] rewrote front pages for ${affectedUserIds.length} user(s)`)
+
+    // 6. Delete loser last — clears its article_topics, signal_queue, user_read_topics rows,
+    //    and repoints articles whose legacy topic_id pointed to loser to a remaining linked topic.
+    db.news.deleteTopic(loserId)
+    console.log(`[merge] done ${loserId} → ${winnerId} in ${Date.now() - startedAt}ms`)
+
+    return { winnerId, affectedUserIds }
+  }
+
   return {
     enqueue,
+    enqueueRegen,
     ungroupArticle,
     unmergeTopic,
+    mergeTopic,
     status() {
       let estimatedBehindMs: number | null = null
 
@@ -447,7 +564,7 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
         }
       }
 
-      return { bufferDepth: buffer.length, processing, estimatedBehindMs }
+      return { bufferDepth: buffer.length, processing, pendingRegens: pendingRegenTopicIds.size, estimatedBehindMs }
     },
     start() {
       timer = setInterval(drain, DRAIN_INTERVAL_MS)

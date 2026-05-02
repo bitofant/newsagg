@@ -1,6 +1,6 @@
 # Consolidator (`src/consolidator/`)
 
-Topic matching, signal generation, summary generation, ungroup/unmerge. The heaviest LLM-using component.
+Topic matching, signal generation, summary generation, ungroup/unmerge/merge. The heaviest LLM-using component.
 
 ## Drain cycle
 
@@ -47,6 +47,23 @@ Then: new topics are created, summaries regenerated, read state is copied from t
 
 The HTTP layer wraps this asynchronously: `POST /api/topics/:id/unmerge` kicks off the work and returns immediately; `GET /api/topics/:id/unmerge-result?wait=N` long-polls (up to 60s, server-clamped) and returns `{ status: 'pending' | 'done' | 'error', newTopics?, error? }`. Job state lives in an in-memory `Map<topicId, UnmergeJob>` in the server with a 5-minute TTL.
 
+## Topic merging
+
+`mergeTopic(loserId, winnerId)` folds duplicate topics together (user-flagged "these are the same story"):
+
+1. Rewire `article_topics` rows from loser → winner via `INSERT OR IGNORE` (handles articles already linked to both).
+2. Concat both topics' `substantial_event_timestamps` (sorted) onto winner — the threshold-gated long-form mode picks up combined history on the next regen.
+3. `db.users.unionReadTopic(loserId, winnerId)` — for any user that had loser read, mark winner read with loser's `read_at` (`INSERT OR IGNORE` preserves any existing winner read_at). Avoids resurfacing a topic the user already saw.
+4. Enqueue summary regen via `enqueueRegen(winnerId)` (skipped if loser had 0 articles). Runs on the next drain cycle; merge endpoint returns immediately. Long-mode dispatch is automatic when regen runs.
+5. Rewrite each user's latest front page in place using winner's *current* (pre-regen) summary: if only loser-section is present, swap in a fresh winner-section at the same index carrying loser's `articleIds`; if both are present, drop loser-section and union loser's `articleIds` into the winner-section. Save as a new `front_pages` row so SSE pushes the update.
+6. `db.news.deleteTopic(loserId)` last — clears `article_topics`, `signal_queue`, `user_read_topics` and repoints any `articles.topic_id` legacy column.
+
+Synchronous (sub-second) via `POST /api/topics/:id/merge` with `{ intoTopicId }`. Returns `{ winnerId, winnerTitle }`. The picker is fed by `GET /api/topics?limit=N` returning `{id, title, updatedAt, articleCount}` ordered by `updated_at DESC`.
+
+## Background regen queue
+
+`enqueueRegen(topicId)` adds a topic id to an in-memory `Set` that the drain processes alongside the article buffer. Used for cases where summary regen should not block a request — currently only `mergeTopic`. The drain runs articles first (if any), then drains regens; both go through the same serialized `processing` flag so LLM calls don't overlap. Errors during regen are logged and don't affect article processing. `status().pendingRegens` exposes the queue depth.
+
 ## Status
 
 Each drain records `{startedAt, endedAt, articleCount}` in a rolling window (size `consolidator.statusWindowMs`), surfaced via `status()` as `estimatedBehindMs` (buffer depth × avg ms/article). LLM busy % is tracked separately in `src/ai/`, not here, because other components also consume LLM time.
@@ -77,6 +94,9 @@ Long-running stories (e.g. the Ukraine war) accumulate dozens of articles, and a
 
 ### Topic unmerging rewrites front pages in place (2026-04-28)
 When the user splits a wrongly-merged topic, `consolidator.unmergeTopic` doesn't just delete the old topic and let the next aggregator tick rebuild — it actively rewrites every user's latest front page, splicing the old section out and the N new sections in at the same index, then saves a new `front_pages` row so SSE pushes the update. Rationale: unmerge is a user-triggered correction; making the user wait up to `intervalMs` (default 15 minutes) for the front page to "look right" feels broken, especially right after the user has confirmed a destructive action. The cost is one parse + splice + INSERT per user with a section referencing that topic — cheap. Read state is also actively migrated (`db.users.replaceReadTopic`) so a user who had marked the merged topic as read sees the new topics under the read line, not surfacing as fresh unread. New `new_topic` signals are still enqueued for all users so future aggregator runs see the new topics naturally; the front-page rewrite is purely an immediate-feedback optimization on top.
+
+### Manual merge is sync via background regen queue (2026-05-01)
+Merge is the inverse of unmerge but doesn't need its two-phase reasoning machinery — the user has already decided "these are duplicates", so there's no LLM classification to make. The only LLM work is one summary regen on the winner. That sounds fast in the median case but isn't: a merge that pushes the combined topic over the bullets threshold runs long-mode regen on ~10 recent articles, which has been observed taking ~5 minutes under LLM load — past most browser/proxy timeouts. So the endpoint is sync but does NOT await regen: `mergeTopic` enqueues the winner via `enqueueRegen(topicId)` and returns immediately, the drain picks it up on its next 5s tick. Tradeoff: front-page rewrite uses winner's pre-merge summary text; the next aggregator tick (per-user `intervalMs`, default 15min) refreshes the rendered summary. Acceptable — the article list and bullets are correct immediately, only the prose summary briefly lags. Read state uses union (`INSERT OR IGNORE`) rather than replace, so if a user had only winner read with a recent `read_at`, it stays — only users who had loser-but-not-winner read get an entry copied. Picker endpoint `GET /api/topics?limit=N` returns light `{id, title, articleCount, updatedAt}` projections; the UI fetches once and filters client-side. Rejected alternatives: (a) async polling job like unmerge — overkill since the merge itself completes in <100ms once regen is decoupled; (b) fire-and-forget `void regenerateTopicSummaries(...)` from inside `mergeTopic` — bypasses the consolidator's serialization and would race with the article drain's own regen calls; the queue keeps all LLM-bound work funneled through one drain. (c) actively rewriting saved front pages again when background regen completes — possible refinement, deferred until staleness becomes annoying in practice.
 
 ### Two-phase unmerge split (2026-04-29)
 The single-shot "partition all articles in one reasoning call" approach (in `splitTopicViaLlm`) timed out repeatedly on real wrongly-merged topics with 60-85 articles — the reasoning chain has to weigh every article against every potential grouping, the chain alone exhausts the 8k output budget before any JSON appears, and the call hits the 5-minute `requestTimeoutMs`. Solution: split the work. **Phase 1** (`identifyNewTopics`, `reasoningEffort: 'high'`) reads only the article titles plus the original (incorrect) topic and outputs sub-topic `{ title, description }` entries — defaulting to 2, capped at 4. The reasoning chain is bounded by "decide the structure" rather than "structure + place every article". **Phase 2** (`assignArticlesToTopics`, `reasoningEffort: 'off'`, parallel via `Promise.all`) takes that small list of candidate topics + chunks the articles by token budget and asks the LLM to classify each article by index — pure mechanical assignment, chunks fan out concurrently. Each chunk's failure mode is "leaves articles unassigned"; the wrapper puts unassigned articles in group 0 so the existing sanitizer can drop empty groups and surface "produced <2 non-empty" if classification went badly. **Phase 1 prompt biases hard toward returning 2 sub-topics**, with explicit instructions that the typical wrong-merge is "one large topic + a small off-topic group that snuck in" and that aspects/sub-themes of the same ongoing story are ONE topic. Without this bias the model fans out into 5-6 buckets even for clearly-2-way splits (a user reported clicking unmerge expecting 2 topics and getting 6). Rejected alternatives: (a) refuse unmerges above N articles (papers over the actual problem and is user-hostile for exactly the cases that need fixing); (b) drop reasoning entirely on the partition decision (the structure-finding step genuinely is reasoning-shaped — without it Qwen3.6 produced incoherent groups in early experiments).

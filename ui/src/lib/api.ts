@@ -119,6 +119,29 @@ export async function getTopicDetail(topicId: number): Promise<TopicDetail | nul
   return res.json() as Promise<TopicDetail>
 }
 
+export interface TopicListEntry {
+  id: number
+  title: string
+  updatedAt: number
+  articleCount: number
+}
+
+export async function listTopics(limit = 200): Promise<TopicListEntry[]> {
+  const res = await fetch(`${BASE}/topics?limit=${limit}`, { headers: authHeaders() })
+  if (!res.ok) throw new Error('Failed to load topics')
+  return res.json() as Promise<TopicListEntry[]>
+}
+
+export async function mergeTopic(topicId: number, intoTopicId: number): Promise<{ winnerId: number; winnerTitle: string }> {
+  const res = await fetch(`${BASE}/topics/${topicId}/merge`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ intoTopicId }),
+  })
+  if (!res.ok) throw new Error((await res.json().catch(() => ({ error: 'merge failed' })) as { error: string }).error)
+  return res.json() as Promise<{ winnerId: number; winnerTitle: string }>
+}
+
 export async function ungroupArticle(topicId: number, articleId: number): Promise<{ newTopicIds: number[] }> {
   const res = await fetch(`${BASE}/topics/${topicId}/articles/${articleId}/ungroup`, {
     method: 'POST',
@@ -184,7 +207,7 @@ export interface Status {
   startedAt: number
   builtAt: number
   llm: { busyPct: number; reqPerMin: number; tokPerSec: number; reasoningTokPerSec: number; windowMs: number }
-  consolidator: { bufferDepth: number; processing: boolean; estimatedBehindMs: number | null }
+  consolidator: { bufferDepth: number; processing: boolean; pendingRegens: number; estimatedBehindMs: number | null }
   aggregator: { queueLength: number; activeWorkers: number }
   db: { topicCount: number; totalArticles: number }
   users: {
