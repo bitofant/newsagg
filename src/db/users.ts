@@ -37,6 +37,8 @@ export interface UserDb {
   unreadTopicForNonDownvoters(topicId: number): void
   /** For every user that had `oldTopicId` marked as read, mark each of `newTopicIds` as read with the same `read_at`. */
   replaceReadTopic(oldTopicId: number, newTopicIds: number[]): void
+  /** Used by mergeTopic: for every user that had `loserTopicId` read but not `winnerTopicId`, mark winner as read with loser's read_at. Existing winner read_at is preserved. */
+  unionReadTopic(loserTopicId: number, winnerTopicId: number): void
   cleanupOldSignals(maxAgeMs: number): void
   saveFrontPage(userId: number, data: string): void
   getLatestFrontPage(userId: number): { generatedAt: number; data: string } | undefined
@@ -235,6 +237,15 @@ export function createUserDb(db: DatabaseSync): UserDb {
         db.exec('ROLLBACK')
         throw e
       }
+    },
+
+    unionReadTopic(loserTopicId, winnerTopicId) {
+      // For every user that had loser read, ensure winner is read too.
+      // INSERT OR IGNORE preserves an existing winner read_at; otherwise loser's read_at is copied.
+      db.prepare(
+        `INSERT OR IGNORE INTO user_read_topics (user_id, topic_id, read_at)
+         SELECT user_id, ?, read_at FROM user_read_topics WHERE topic_id = ?`,
+      ).run(winnerTopicId, loserTopicId)
     },
 
     unreadTopicForNonDownvoters(topicId) {

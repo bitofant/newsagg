@@ -2,11 +2,11 @@
   import { onMount } from 'svelte'
   import { goto } from '$app/navigation'
   import { page } from '$app/state'
-  import { isLoggedIn, getTopicDetail, vote, setTopicRead, ungroupArticle, startUnmerge, pollUnmergeResult } from '$lib/api'
-  import type { TopicDetail } from '$lib/api'
+  import { isLoggedIn, getTopicDetail, vote, setTopicRead, ungroupArticle, startUnmerge, pollUnmergeResult, listTopics, mergeTopic } from '$lib/api'
+  import type { TopicDetail, TopicListEntry } from '$lib/api'
   import { timeAgo } from '$lib/time'
   import { morphSnapshot } from '$lib/transition'
-  import { ArrowLeft, ThumbsUp, ThumbsDown, CircleCheck, Circle, Unlink2, Split, Loader2 } from 'lucide-svelte'
+  import { ArrowLeft, ThumbsUp, ThumbsDown, CircleCheck, Circle, Unlink2, Split, Merge, Loader2, Search, X } from 'lucide-svelte'
   import { fade } from 'svelte/transition'
 
   type UnmergePhase = 'confirm' | 'pending' | 'done' | 'error'
@@ -16,12 +16,25 @@
     error?: string
   }
 
+  type MergePhase = 'picker' | 'confirm' | 'pending' | 'done' | 'error'
+  interface MergeOverlay {
+    phase: MergePhase
+    topics?: TopicListEntry[]
+    query?: string
+    loading?: boolean
+    destination?: TopicListEntry
+    winnerId?: number
+    winnerTitle?: string
+    error?: string
+  }
+
   let topic = $state<TopicDetail | null>(null)
   let loading = $state(true)
   let error = $state('')
   let votes = $state(new Map<number, 1 | -1>())
   let ungroupingArticles = $state(new Set<number>())
   let unmergeOverlay = $state<UnmergeOverlay | null>(null)
+  let mergeOverlay = $state<MergeOverlay | null>(null)
 
   $effect(() => {
     const id = page.params['topicId']
@@ -119,6 +132,48 @@
     const wasDone = unmergeOverlay?.phase === 'done'
     unmergeOverlay = null
     if (wasDone) goto('/')
+  }
+
+  async function startMergePicker() {
+    if (!topic || mergeOverlay || unmergeOverlay) return
+    const currentId = topic.id
+    mergeOverlay = { phase: 'picker', loading: true, query: '' }
+    try {
+      const all = await listTopics(200)
+      if (!mergeOverlay) return
+      mergeOverlay = { phase: 'picker', topics: all.filter((t) => t.id !== currentId), query: '', loading: false }
+    } catch (e) {
+      mergeOverlay = { phase: 'error', error: String(e) }
+    }
+  }
+
+  function pickMergeDestination(t: TopicListEntry) {
+    mergeOverlay = { phase: 'confirm', destination: t }
+  }
+
+  function cancelMerge() {
+    mergeOverlay = null
+  }
+
+  async function confirmMerge() {
+    if (!topic || !mergeOverlay?.destination) return
+    const dest = mergeOverlay.destination
+    const topicId = topic.id
+    mergeOverlay = { phase: 'pending', destination: dest }
+    try {
+      const r = await mergeTopic(topicId, dest.id)
+      mergeOverlay = { phase: 'done', destination: dest, winnerId: r.winnerId, winnerTitle: r.winnerTitle }
+    } catch (e) {
+      mergeOverlay = { phase: 'error', destination: dest, error: String(e) }
+    }
+  }
+
+  function dismissMergeOverlay() {
+    const overlay = mergeOverlay
+    mergeOverlay = null
+    if (overlay?.phase === 'done' && overlay.winnerId !== undefined) {
+      goto(`/topics/${overlay.winnerId}`)
+    }
   }
 
   async function handleUngroup(articleId: number) {
@@ -238,12 +293,21 @@
         </button>
         <button
           onclick={startUnmergeConfirm}
-          disabled={!!unmergeOverlay || topic.articles.length < 2}
+          disabled={!!unmergeOverlay || !!mergeOverlay || topic.articles.length < 2}
           class="flex items-center gap-2 px-3 py-2 rounded-full text-sm transition-colors text-stone-600 dark:text-stone-400 hover:bg-stone-100 dark:hover:bg-stone-800 disabled:opacity-40 disabled:cursor-not-allowed"
           title="Split this topic into separate topics"
         >
           <Split size={20} />
           <span>Unmerge</span>
+        </button>
+        <button
+          onclick={startMergePicker}
+          disabled={!!unmergeOverlay || !!mergeOverlay}
+          class="flex items-center gap-2 px-3 py-2 rounded-full text-sm transition-colors text-stone-600 dark:text-stone-400 hover:bg-stone-100 dark:hover:bg-stone-800 disabled:opacity-40 disabled:cursor-not-allowed"
+          title="Merge this topic into another (mark as duplicate)"
+        >
+          <Merge size={20} />
+          <span>Merge into…</span>
         </button>
       </div>
 
@@ -334,6 +398,103 @@
         >
           <h3 class="font-serif text-3xl font-bold text-white drop-shadow-md mb-2">Split failed</h3>
           <p class="text-white text-base">{unmergeOverlay.error ?? 'unknown error'}</p>
+          <p class="absolute bottom-4 left-0 right-0 text-center text-xs uppercase tracking-widest text-white/80">Tap to dismiss</p>
+        </button>
+      {/if}
+
+      {#if mergeOverlay?.phase === 'picker'}
+        <div
+          class="absolute inset-0 bg-stone-900/95 dark:bg-black/95 rounded-xl flex flex-col z-10 overflow-hidden"
+          transition:fade={{ duration: 150 }}
+        >
+          <div class="flex items-center gap-2 p-3 border-b border-white/10">
+            <Search size={20} class="text-stone-400 shrink-0" />
+            <input
+              type="text"
+              bind:value={mergeOverlay.query}
+              placeholder="Find topic to merge into…"
+              class="flex-1 bg-transparent text-white placeholder:text-stone-500 outline-none text-base"
+            />
+            <button onclick={cancelMerge} class="p-1.5 text-stone-400 hover:text-white" aria-label="Cancel">
+              <X size={18} />
+            </button>
+          </div>
+          <div class="flex-1 overflow-y-auto">
+            {#if mergeOverlay.loading}
+              <p class="text-stone-400 text-center mt-10">Loading…</p>
+            {:else}
+              {@const q = (mergeOverlay.query ?? '').toLowerCase().trim()}
+              {@const filtered = (mergeOverlay.topics ?? []).filter((t) => !q || t.title.toLowerCase().includes(q))}
+              {#if filtered.length === 0}
+                <p class="text-stone-400 text-center mt-10">No matching topics</p>
+              {:else}
+                <ul class="divide-y divide-white/5">
+                  {#each filtered as t (t.id)}
+                    <li>
+                      <button
+                        onclick={() => pickMergeDestination(t)}
+                        class="w-full text-left px-4 py-3 hover:bg-white/10 transition-colors"
+                      >
+                        <div class="text-white font-medium leading-snug">{t.title}</div>
+                        <div class="text-xs text-stone-400 mt-0.5">
+                          {t.articleCount} article{t.articleCount === 1 ? '' : 's'} · {timeAgo(t.updatedAt)}
+                        </div>
+                      </button>
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
+            {/if}
+          </div>
+        </div>
+      {:else if mergeOverlay?.phase === 'confirm'}
+        <div
+          class="absolute inset-0 flex rounded-xl overflow-hidden z-10"
+          transition:fade={{ duration: 150 }}
+        >
+          <button
+            onclick={confirmMerge}
+            class="flex-1 bg-green-500/60 hover:bg-green-500/80 flex items-center justify-center transition-colors"
+            aria-label="Confirm merge"
+          ><ThumbsUp size={96} class="text-white drop-shadow" /></button>
+          <button
+            onclick={cancelMerge}
+            class="flex-1 bg-red-500/60 hover:bg-red-500/80 flex items-center justify-center transition-colors"
+            aria-label="Cancel"
+          ><ThumbsDown size={96} class="text-white drop-shadow" /></button>
+          <div class="absolute top-6 left-0 right-0 text-center px-6 pointer-events-none">
+            <h3 class="font-serif text-2xl md:text-3xl font-bold text-white drop-shadow-md">Merge into:</h3>
+            <p class="mt-2 text-white text-lg font-medium drop-shadow leading-snug">{mergeOverlay.destination?.title ?? ''}</p>
+          </div>
+        </div>
+      {:else if mergeOverlay?.phase === 'pending'}
+        <div
+          class="absolute inset-0 bg-yellow-400/70 rounded-xl flex flex-col items-center justify-center z-10"
+          transition:fade={{ duration: 150 }}
+        >
+          <h3 class="font-serif text-3xl font-bold text-white drop-shadow-md mb-5">Merging topics…</h3>
+          <Loader2 size={80} class="animate-spin text-white drop-shadow" />
+        </div>
+      {:else if mergeOverlay?.phase === 'done'}
+        <button
+          onclick={dismissMergeOverlay}
+          class="absolute inset-0 bg-green-500/75 rounded-xl flex flex-col items-center justify-center z-10 px-6 py-10 cursor-pointer"
+          transition:fade={{ duration: 150 }}
+          aria-label="Open merged topic"
+        >
+          <h3 class="font-serif text-3xl font-bold text-white drop-shadow-md mb-3">Merged into:</h3>
+          <p class="text-white text-lg font-medium leading-snug text-center max-w-full">{mergeOverlay.winnerTitle ?? ''}</p>
+          <p class="absolute bottom-4 left-0 right-0 text-center text-xs uppercase tracking-widest text-white/80">Tap to open</p>
+        </button>
+      {:else if mergeOverlay?.phase === 'error'}
+        <button
+          onclick={dismissMergeOverlay}
+          class="absolute inset-0 bg-red-500/75 rounded-xl flex flex-col items-center justify-center z-10 px-6 py-10 cursor-pointer"
+          transition:fade={{ duration: 150 }}
+          aria-label="Dismiss"
+        >
+          <h3 class="font-serif text-3xl font-bold text-white drop-shadow-md mb-2">Merge failed</h3>
+          <p class="text-white text-base">{mergeOverlay.error ?? 'unknown error'}</p>
           <p class="absolute bottom-4 left-0 right-0 text-center text-xs uppercase tracking-widest text-white/80">Tap to dismiss</p>
         </button>
       {/if}

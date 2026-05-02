@@ -215,6 +215,21 @@ export async function createServer({ db, aggregator, consolidator, profiler, con
 
   // --- Topics ---
 
+  app.get('/api/topics', async (req, reply) => {
+    const userId = authenticate(req)
+    if (!userId) return reply.status(401).send({ error: 'unauthorized' })
+
+    const limitParam = (req.query as Record<string, string>).limit
+    const limit = limitParam ? Math.max(1, Math.min(500, parseInt(limitParam, 10) || 200)) : 200
+    const topics = db.news.listTopics().slice(0, limit)
+    return topics.map((t) => ({
+      id: t.id,
+      title: t.title,
+      updatedAt: t.updatedAt,
+      articleCount: db.news.getArticleCountByTopic(t.id),
+    }))
+  })
+
   app.get('/api/topics/:topicId', async (req, reply) => {
     const userId = authenticate(req)
     if (!userId) return reply.status(401).send({ error: 'unauthorized' })
@@ -256,6 +271,35 @@ export async function createServer({ db, aggregator, consolidator, profiler, con
 
     const articles = db.news.listArticlesByTopic(topicId)
     return articles.map(({ id, title, source, url, fetchedAt }) => ({ id, title, source, url, fetchedAt }))
+  })
+
+  app.post('/api/topics/:topicId/merge', async (req, reply) => {
+    const callerId = authenticate(req)
+    if (!callerId) return reply.status(401).send({ error: 'unauthorized' })
+
+    const topicId = parseInt((req.params as { topicId: string }).topicId, 10)
+    if (isNaN(topicId)) return reply.status(400).send({ error: 'invalid topicId' })
+
+    const { intoTopicId } = req.body as { intoTopicId?: number }
+    if (typeof intoTopicId !== 'number' || isNaN(intoTopicId)) {
+      return reply.status(400).send({ error: 'intoTopicId (number) required' })
+    }
+    if (topicId === intoTopicId) {
+      return reply.status(400).send({ error: 'cannot merge a topic into itself' })
+    }
+    if (!db.news.getTopic(topicId)) return reply.status(404).send({ error: 'topic not found' })
+    const winner = db.news.getTopic(intoTopicId)
+    if (!winner) return reply.status(404).send({ error: 'destination topic not found' })
+
+    try {
+      const { winnerId, affectedUserIds } = await consolidator.mergeTopic(topicId, intoTopicId)
+      const generatedAt = Date.now()
+      for (const uid of affectedUserIds) notifyUser(uid, generatedAt)
+      return { winnerId, winnerTitle: winner.title }
+    } catch (err) {
+      req.log.error(err, 'merge failed')
+      return reply.status(500).send({ error: 'merge failed' })
+    }
   })
 
   app.post('/api/topics/:topicId/articles/:articleId/ungroup', async (req, reply) => {
