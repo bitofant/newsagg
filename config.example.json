@@ -11,13 +11,14 @@
     }
   },
   "ai": {
-    "_comment": "backend: 'ollama' or 'vllm'. For vLLM: set model and maxContextTokens to \"auto\" to fetch from /v1/models at startup. requestTimeoutMs caps every chat-completion call.",
+    "_comment": "backend: 'ollama' or 'vllm'. For vLLM: set model and maxContextTokens to \"auto\" to fetch from /v1/models at startup. requestTimeoutMs caps every chat-completion call. maxConcurrency caps in-flight LLM requests; topic matching runs at low priority and yields to everything else.",
     "backend": "ollama",
     "url": "http://localhost:11434/v1",
     "model": "gemma3:27b",
     "maxContextTokens": 40960,
     "statusWindowMs": 600000,
-    "requestTimeoutMs": 300000
+    "requestTimeoutMs": 300000,
+    "maxConcurrency": 12
   },
   "consolidator": {
     "statusWindowMs": 600000
