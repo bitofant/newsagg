@@ -1,4 +1,5 @@
 import { getAi } from '../ai/index.js'
+import { MAX_OUTPUT_TOKENS } from '../ai/provider.js'
 import type { Db } from '../db/index.js'
 import type { AggregatorConfig } from '../config.js'
 import type { Signal } from '../db/users.js'
@@ -38,6 +39,11 @@ export interface Aggregator {
 
 const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000
 const MAX_SECTIONS = 100
+
+const RELEVANCE_SYSTEM = `You are a news relevance scorer. Rate each topic in the user's message against the reader's preference profile on a scale of 1-5 (1=not relevant, 5=highly relevant).
+
+Reply with ONLY a JSON array of numbers, one per topic in order. Example: [3, 5, 1, 4, ...]
+Do not wrap in markdown code fences.`
 const MAX_SUMMARY_CHARS = 300
 
 // IMPLEMENTED: scheduling loop, worker pool, per-user intervals, SQLite-backed front pages,
@@ -200,14 +206,15 @@ export function createAggregator({
           .map((s, i) => `${i + 1}. ${s.section.topicTitle}`)
           .join('\n')
 
+        // Profile is stable per-user across many ticks; topic list changes every tick. Profile-first
+        // makes the system + profile prefix cacheable across consecutive front-page generations.
         const prompt =
-          `Rate the relevance of each topic to this reader's preferences on a scale of 1-5 (1=not relevant, 5=highly relevant).\n\n` +
           `Reader's preference profile:\n${preferenceProfile}\n\n` +
-          `Topics:\n${topicList}\n\n` +
-          `Reply with ONLY a JSON array of numbers, one per topic in order. Example: [3, 5, 1, 4, ...]\n` +
-          `Do not wrap in markdown code fences.`
+          `Topics:\n${topicList}`
 
-        const raw = await getAi().complete(prompt, { systemPrompt: 'You are a news relevance scorer.', reasoningEffort: 'off' })
+        // Output: JSON array of N integers — `[3, 5, 1, ...]`. ~4 tokens per score plus brackets/commas.
+        const maxTokens = Math.min(MAX_OUTPUT_TOKENS, 32 + sectionsWithRelevance.length * 4)
+        const raw = await getAi().complete(prompt, { systemPrompt: RELEVANCE_SYSTEM, reasoningEffort: 'off', maxTokens })
         const scores = JSON.parse(stripCodeFences(raw)) as number[]
         if (Array.isArray(scores) && scores.length === sectionsWithRelevance.length) {
           for (let i = 0; i < scores.length; i++) {

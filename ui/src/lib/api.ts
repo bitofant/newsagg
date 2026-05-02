@@ -206,7 +206,7 @@ export interface Status {
   timestamp: number
   startedAt: number
   builtAt: number
-  llm: { busyPct: number; reqPerMin: number; tokPerSec: number; reasoningTokPerSec: number; windowMs: number }
+  llm: { busyPct: number; reqPerMin: number; tokPerSec: number; reasoningTokPerSec: number; cacheHitPct: number; windowMs: number }
   consolidator: { bufferDepth: number; processing: boolean; pendingRegens: number; estimatedBehindMs: number | null }
   aggregator: { queueLength: number; activeWorkers: number }
   db: { topicCount: number; totalArticles: number }

@@ -669,6 +669,11 @@ At least 2 entries are required.`
     .filter((t) => t.title && t.description)
 }
 
+const UNMERGE_ASSIGN_SYSTEM = `You are a news editor. Assign each article in the user's message to exactly one of the candidate topics by index.
+
+Reply with ONLY JSON: { "assignments": [<topicIndex>, <topicIndex>, ...] }
+Output exactly one topicIndex per article in the order given.`
+
 /**
  * Phase 2: classify each article into one of the identified sub-topics by index.
  * Token-budget chunked, fans chunks out in parallel via Promise.all. Returns an array of length
@@ -680,9 +685,9 @@ async function assignArticlesToTopics(
   topics: IdentifiedTopic[],
 ): Promise<number[]> {
   const topicOptions = topics.map((t, i) => `${i}: ${t.title} — ${t.description}`).join('\n')
-  const instructionsPrefix = `You are a news editor. Assign each article below to exactly one of these candidate topics by index.\n\nTopics:\n${topicOptions}\n\nArticles:\n`
-  const instructionsSuffix = `\n\nReply with ONLY JSON: { "assignments": [<topicIndex>, <topicIndex>, ...] }\nOutput exactly one topicIndex per article in the order given.`
-  const fixedOverhead = estimateTokens(instructionsPrefix + instructionsSuffix)
+  // topicOptions is per-unmerge dynamic, kept in user prompt; only the static rules go in systemPrompt.
+  const userPrefix = `Topics:\n${topicOptions}\n\nArticles:\n`
+  const fixedOverhead = estimateTokens(UNMERGE_ASSIGN_SYSTEM) + estimateTokens(userPrefix)
 
   const renderedItems = articles.map((a, i) => `${i}: ${a.title} — ${a.text.slice(0, 200)}`)
   const indexes = articles.map((_, i) => i)
@@ -697,8 +702,11 @@ async function assignArticlesToTopics(
         .map((origIdx, localIdx) => `${localIdx}: ${articles[origIdx].title} — ${articles[origIdx].text.slice(0, 200)}`)
         .join('\n')
 
-      const response = await ai.complete(instructionsPrefix + articleList + instructionsSuffix, {
+      // Per-article output: 1 integer in JSON array ≈ ~5 tokens; pad to 16.
+      const response = await ai.complete(userPrefix + articleList, {
+        systemPrompt: UNMERGE_ASSIGN_SYSTEM,
         reasoningEffort: 'off',
+        maxTokens: Math.min(MAX_OUTPUT_TOKENS, 64 + chunkIndexes.length * 16),
       })
 
       try {
@@ -727,6 +735,15 @@ interface BatchMatchEntry {
   topics: Topic[]
 }
 
+// Versioned constant — keep byte-identical across calls so vLLM prefix caching can reuse the system block.
+const TOPIC_MATCH_SYSTEM = `You are a news editor. Match new articles to existing topics. For each article, decide which existing topics it belongs to. An article may match multiple topics if it covers multiple subjects. Only match if the article contains substantial information about that topic — a passing mention is not enough.
+
+Reply with a JSON array. Each entry has "article" (the article index number) and "topicIds" (an array of matching topic ID numbers, or an empty array if no match).
+
+Example: [{"article": 0, "topicIds": [5, 12]}, {"article": 1, "topicIds": []}]
+
+Reply with ONLY the JSON array, no other text.`
+
 async function matchBatchAgainstTopics(
   ai: InferenceProvider,
   articles: RawArticle[],
@@ -738,10 +755,10 @@ async function matchBatchAgainstTopics(
     .map((a, i) => `${i}: ${a.title} — ${a.text.slice(0, 200)}`)
     .join('\n')
 
-  // Fixed overhead = instructions + article list (articles are constant across topic sub-chunks)
-  const instructionsPrefix = `You are a news editor. Match new articles to existing topics.\n\nExisting topics:\n`
-  const instructionsSuffix = `\n\nNew articles:\n${articleList}\n\nFor each article, decide which existing topics it belongs to. An article may match multiple topics if it covers multiple subjects. Only match if the article contains substantial information about that topic — a passing mention is not enough.\nReply with a JSON array. Each entry has "article" (the article index number) and "topicIds" (an array of matching topic ID numbers, or an empty array if no match).\n\nExample: [{"article": 0, "topicIds": [5, 12]}, {"article": 1, "topicIds": []}]\n\nReply with ONLY the JSON array, no other text.`
-  const fixedOverhead = estimateTokens(instructionsPrefix + instructionsSuffix)
+  // Articles are constant across topic-chunk siblings — placing them first in the user prompt makes
+  // them part of the cacheable prefix shared by the parallel chunks of one batch.
+  const userPrefix = `New articles:\n${articleList}\n\nExisting topics:\n`
+  const fixedOverhead = estimateTokens(TOPIC_MATCH_SYSTEM) + estimateTokens(userPrefix)
 
   const renderedTopics = topics.map((t) => `${t.id}: ${t.title} — ${t.description}`)
   // Matching uses reasoningEffort: 'high' — reserve the larger output budget so chunking accounts for it.
@@ -751,7 +768,10 @@ async function matchBatchAgainstTopics(
   const chunkResults = await Promise.all(
     chunks.map(async (chunk): Promise<BatchMatchEntry[]> => {
       const topicList = chunk.map((t) => `${t.id}: ${t.title} — ${t.description}`).join('\n')
-      const response = await ai.complete(instructionsPrefix + topicList + instructionsSuffix, { reasoningEffort: 'high' })
+      const response = await ai.complete(userPrefix + topicList, {
+        systemPrompt: TOPIC_MATCH_SYSTEM,
+        reasoningEffort: 'high',
+      })
 
       try {
         const results = JSON.parse(stripCodeFences(response)) as { article: number; topicIds: number[] }[]
@@ -797,7 +817,7 @@ Title: ${article.title}
 Text: ${article.text.slice(0, 500)}
 
 Reply with JSON only: { "title": "short topic title", "description": "one sentence terse description" }`,
-    { reasoningEffort: 'off' },
+    { reasoningEffort: 'off', maxTokens: 256 },
   )
 
   try {
@@ -807,6 +827,14 @@ Reply with JSON only: { "title": "short topic title", "description": "one senten
     return { title: article.title.slice(0, 80), description: article.text.slice(0, 120) }
   }
 }
+
+const TOPIC_SUMMARY_SYSTEM = `You are a news editor. Create topic entries for each of the articles in the user's message. For each article, create a topic with a short title and a one-sentence terse description.
+
+Reply with a JSON array where each entry has "index" (the article number), "title", and "description".
+
+Example: [{"index": 0, "title": "...", "description": "..."}, {"index": 1, "title": "...", "description": "..."}]
+
+Reply with ONLY the JSON array, no other text.`
 
 /** Batch-generate topic summaries for multiple unmatched articles in one or more LLM calls */
 async function generateTopicSummaries(
@@ -818,9 +846,8 @@ async function generateTopicSummaries(
     return [await generateTopicSummary(ai, articles[0])]
   }
 
-  const instructionsPrefix = `You are a news editor. Create topic entries for each of these new articles.\n\nArticles:\n`
-  const instructionsSuffix = `\n\nFor each article, create a topic with a short title and a one-sentence terse description.\nReply with a JSON array where each entry has "index" (the article number), "title", and "description".\n\nExample: [{"index": 0, "title": "...", "description": "..."}, {"index": 1, "title": "...", "description": "..."}]\n\nReply with ONLY the JSON array, no other text.`
-  const fixedOverhead = estimateTokens(instructionsPrefix + instructionsSuffix)
+  const userPrefix = `Articles:\n`
+  const fixedOverhead = estimateTokens(TOPIC_SUMMARY_SYSTEM) + estimateTokens(userPrefix)
 
   // Build results with fallbacks (overridden on successful parse)
   const results: { title: string; description: string }[] = articles.map((a) => ({
@@ -844,7 +871,12 @@ async function generateTopicSummaries(
       .map((originalIndex, localIndex) => `${localIndex}: "${articles[originalIndex].title}" — ${articles[originalIndex].text.slice(0, 300)}`)
       .join('\n\n')
 
-    const response = await ai.complete(instructionsPrefix + articleList + instructionsSuffix, { reasoningEffort: 'off' })
+    // Per-item output ≈ 80 tokens (`{"index":N,"title":"...","description":"..."}`); pad to 200 for safety.
+    const response = await ai.complete(userPrefix + articleList, {
+      systemPrompt: TOPIC_SUMMARY_SYSTEM,
+      reasoningEffort: 'off',
+      maxTokens: Math.min(MAX_OUTPUT_TOKENS, 64 + chunk.length * 200),
+    })
 
     try {
       const parsed = JSON.parse(stripCodeFences(response)) as { index: number; title: string; description: string }[]
@@ -904,19 +936,31 @@ async function regenerateTopicSummary(ai: InferenceProvider, db: Db, topicId: nu
   return regenerateTopicSummaries(ai, db, [topicId])
 }
 
+const SHORT_MODE_SINGLE_SYSTEM = `You are a news editor. Write a concise 2-3 sentence summary of the news topic in the user's message based on the latest articles.
+Some articles may cover multiple topics — focus ONLY on aspects relevant to this specific topic.
+Prefer concrete facts (who/what/when) over mood or analysis. Skip emotional content unless paired with a real event.
+
+Reply with ONLY the summary text, no JSON, no formatting.`
+
+const SHORT_MODE_BATCH_SYSTEM = `You are a news editor. Write concise 2-3 sentence summaries for each of the news topics in the user's message based on their latest articles.
+Some articles may cover multiple topics — focus ONLY on aspects relevant to each specific topic.
+Prefer concrete facts (who/what/when) over mood or analysis. Skip emotional content unless paired with a real event.
+
+Reply with a JSON array where each entry has "topicId" (the topic ID number) and "summary" (the 2-3 sentence summary text).
+
+Example: [{"topicId": 5, "summary": "..."}, {"topicId": 12, "summary": "..."}]
+
+Reply with ONLY the JSON array, no other text.`
+
 async function regenerateShortMode(ai: InferenceProvider, db: Db, contexts: TopicContext[]): Promise<void> {
   if (contexts.length === 1) {
     const ctx = contexts[0]
     try {
       const response = await ai.complete(
-        `You are a news editor. Write a concise 2-3 sentence summary of this news topic based on the latest articles.\n` +
-          `Some articles may cover multiple topics — focus ONLY on aspects relevant to this specific topic.\n` +
-          `Prefer concrete facts (who/what/when) over mood or analysis. Skip emotional content unless paired with a real event.\n\n` +
-          `Topic: ${ctx.topic.title}\n` +
+        `Topic: ${ctx.topic.title}\n` +
           `Background: ${ctx.topic.description}\n\n` +
-          `Recent articles:\n${ctx.articleContext}\n\n` +
-          `Reply with ONLY the summary text, no JSON, no formatting.`,
-        { reasoningEffort: 'off' },
+          `Recent articles:\n${ctx.articleContext}`,
+        { systemPrompt: SHORT_MODE_SINGLE_SYSTEM, reasoningEffort: 'off', maxTokens: 256 },
       )
       const summary = response.trim()
       if (summary) {
@@ -928,9 +972,11 @@ async function regenerateShortMode(ai: InferenceProvider, db: Db, contexts: Topi
     return
   }
 
-  const instructionsPrefix = `You are a news editor. Write concise 2-3 sentence summaries for each of the following news topics based on their latest articles.\nSome articles may cover multiple topics — focus ONLY on aspects relevant to each specific topic.\nPrefer concrete facts (who/what/when) over mood or analysis. Skip emotional content unless paired with a real event.\n\n`
-  const instructionsSuffix = `\n\nReply with a JSON array where each entry has "topicId" (the topic ID number) and "summary" (the 2-3 sentence summary text).\n\nExample: [{"topicId": 5, "summary": "..."}, {"topicId": 12, "summary": "..."}]\n\nReply with ONLY the JSON array, no other text.`
-  const fixedOverhead = estimateTokens(instructionsPrefix + instructionsSuffix)
+  // Sort for deterministic prefix across re-runs over the same topic set.
+  contexts = [...contexts].sort((a, b) => a.topicId - b.topicId)
+
+  const userPrefix = `Topics:\n`
+  const fixedOverhead = estimateTokens(SHORT_MODE_BATCH_SYSTEM) + estimateTokens(userPrefix)
 
   const renderedContexts = contexts.map(
     (ctx) =>
@@ -952,7 +998,12 @@ async function regenerateShortMode(ai: InferenceProvider, db: Db, contexts: Topi
       .join('\n\n---\n\n')
 
     try {
-      const response = await ai.complete(instructionsPrefix + topicList + instructionsSuffix, { reasoningEffort: 'off' })
+      // Per-topic output ≈ 200 tokens (2-3 sentences + JSON wrap); pad to 300.
+      const response = await ai.complete(userPrefix + topicList, {
+        systemPrompt: SHORT_MODE_BATCH_SYSTEM,
+        reasoningEffort: 'off',
+        maxTokens: Math.min(MAX_OUTPUT_TOKENS, 128 + chunk.length * 300),
+      })
 
       const parsed = JSON.parse(stripCodeFences(response)) as { topicId: number; summary: string }[]
       for (const entry of parsed) {
@@ -1024,12 +1075,7 @@ function parseLongModeResult(raw: unknown): LongModeResult | null {
   return { summary, bullets, newInfo }
 }
 
-async function regenerateLongMode(ai: InferenceProvider, db: Db, contexts: TopicContext[]): Promise<void> {
-  if (contexts.length === 1) {
-    const ctx = contexts[0]
-    const prompt = `You are a news editor maintaining a running brief for an ongoing situation.
-
-${renderLongModeContext(ctx)}
+const LONG_MODE_SINGLE_SYSTEM = `You are a news editor maintaining a running brief for an ongoing situation.
 
 Produce an updated brief with three fields:
 - "summary": 2-3 sentences capturing the stable overall situation. This is the running context — avoid restating individual events.
@@ -1040,8 +1086,28 @@ ${LONG_MODE_STYLE_RULES}
 
 Reply with ONLY JSON: { "summary": "...", "bullets": ["..."], "newInfo": ["..."] }`
 
+const LONG_MODE_BATCH_SYSTEM = `You are a news editor maintaining running briefs for several ongoing situations.
+
+For each topic in the user's message, produce an updated brief with: a stable 2-3 sentence "summary", a "bullets" array (max 8) of material developments to date oldest-relevant first, and a "newInfo" array (0-3) of bullets that are materially new since the previous regeneration. Empty newInfo array if nothing meaningfully new. Fold previously-NEW items into "bullets" if still relevant; drop superseded ones.
+
+${LONG_MODE_STYLE_RULES}
+
+Reply with a JSON array, one entry per topic, each having "topicId", "summary", "bullets" (array of strings), "newInfo" (array of strings).
+
+Example: [{"topicId": 5, "summary": "...", "bullets": ["..."], "newInfo": ["..."]}, ...]
+
+Reply with ONLY the JSON array, no other text.`
+
+async function regenerateLongMode(ai: InferenceProvider, db: Db, contexts: TopicContext[]): Promise<void> {
+  if (contexts.length === 1) {
+    const ctx = contexts[0]
     try {
-      const response = await ai.complete(prompt, { reasoningEffort: 'off' })
+      // Output: summary + ≤8 bullets + ≤3 newInfo + JSON wrap ≈ ~600 tokens; pad to 1024.
+      const response = await ai.complete(renderLongModeContext(ctx), {
+        systemPrompt: LONG_MODE_SINGLE_SYSTEM,
+        reasoningEffort: 'off',
+        maxTokens: 1024,
+      })
       const parsed = parseLongModeResult(JSON.parse(stripCodeFences(response)))
       if (parsed) {
         db.news.updateTopicLongForm(ctx.topicId, parsed)
@@ -1054,9 +1120,11 @@ Reply with ONLY JSON: { "summary": "...", "bullets": ["..."], "newInfo": ["..."]
     return
   }
 
-  const instructionsPrefix = `You are a news editor maintaining running briefs for several ongoing situations.\n\nFor each topic below, produce an updated brief with: a stable 2-3 sentence "summary", a "bullets" array (max 8) of material developments to date oldest-relevant first, and a "newInfo" array (0-3) of bullets that are materially new since the previous regeneration. Empty newInfo array if nothing meaningfully new. Fold previously-NEW items into "bullets" if still relevant; drop superseded ones.\n\n${LONG_MODE_STYLE_RULES}\n\nTopics:\n`
-  const instructionsSuffix = `\n\nReply with a JSON array, one entry per topic, each having "topicId", "summary", "bullets" (array of strings), "newInfo" (array of strings).\n\nExample: [{"topicId": 5, "summary": "...", "bullets": ["..."], "newInfo": ["..."]}, ...]\n\nReply with ONLY the JSON array, no other text.`
-  const fixedOverhead = estimateTokens(instructionsPrefix + instructionsSuffix)
+  // Sort for deterministic prefix across re-runs over the same topic set.
+  contexts = [...contexts].sort((a, b) => a.topicId - b.topicId)
+
+  const userPrefix = `Topics:\n`
+  const fixedOverhead = estimateTokens(LONG_MODE_BATCH_SYSTEM) + estimateTokens(userPrefix)
 
   const renderedContexts = contexts.map((ctx) => `Topic ${ctx.topicId}\n${renderLongModeContext(ctx)}`)
   const chunks = chunkByTokens(contexts, renderedContexts, inputBudget(ai, fixedOverhead))
@@ -1072,7 +1140,12 @@ Reply with ONLY JSON: { "summary": "...", "bullets": ["..."], "newInfo": ["..."]
       .join('\n\n---\n\n')
 
     try {
-      const response = await ai.complete(instructionsPrefix + topicList + instructionsSuffix, { reasoningEffort: 'off' })
+      // Per-topic output ≈ 600 tokens; pad to 1000.
+      const response = await ai.complete(userPrefix + topicList, {
+        systemPrompt: LONG_MODE_BATCH_SYSTEM,
+        reasoningEffort: 'off',
+        maxTokens: Math.min(MAX_OUTPUT_TOKENS, 256 + chunk.length * 1000),
+      })
       const parsed = JSON.parse(stripCodeFences(response)) as { topicId: number; summary: string; bullets: string[]; newInfo: string[] }[]
       if (!Array.isArray(parsed)) {
         console.error('[consolidator] long-mode batch response was not an array, skipping chunk')
@@ -1104,6 +1177,17 @@ interface AssessmentPairInput {
   recentArticleTitles: string[]
 }
 
+const ASSESS_BATCH_SYSTEM = `You are a news editor. Assess each new article in the context of its topic.
+
+For each pair in the user's message, determine:
+- "isSubstantial": Is this a major new development (not just a routine update or minor rehash)?
+- "isConcluded": Does this article indicate the story has reached a conclusion or resolution?
+
+Reply with a JSON array, one entry per pair in order:
+[{"index": 0, "isSubstantial": true/false, "isConcluded": true/false}, ...]
+
+Reply with ONLY the JSON array, no other text.`
+
 /** Batch-assess multiple article-topic pairs in one LLM call */
 async function assessArticleBatch(
   ai: InferenceProvider,
@@ -1134,7 +1218,7 @@ Determine:
 2. "isConcluded": Does this article indicate the issue/story has reached a conclusion or resolution (e.g., final verdict, deal closed, crisis resolved, investigation completed)?
 
 Reply with ONLY JSON: {"isSubstantial": true/false, "isConcluded": true/false}`,
-      { reasoningEffort: 'off' },
+      { reasoningEffort: 'off', maxTokens: 128 },
     )
 
     try {
@@ -1147,9 +1231,8 @@ Reply with ONLY JSON: {"isSubstantial": true/false, "isConcluded": true/false}`,
   }
 
   // Multiple pairs — split by token budget and batch each chunk
-  const instructionsPrefix = `You are a news editor. Assess each new article in the context of its topic.\n\nFor each pair below, determine:\n- "isSubstantial": Is this a major new development (not just a routine update or minor rehash)?\n- "isConcluded": Does this article indicate the story has reached a conclusion or resolution?\n\nPairs:\n`
-  const instructionsSuffix = `\n\nReply with a JSON array, one entry per pair in order:\n[{"index": 0, "isSubstantial": true/false, "isConcluded": true/false}, ...]\n\nReply with ONLY the JSON array, no other text.`
-  const fixedOverhead = estimateTokens(instructionsPrefix + instructionsSuffix)
+  const userPrefix = `Pairs:\n`
+  const fixedOverhead = estimateTokens(ASSESS_BATCH_SYSTEM) + estimateTokens(userPrefix)
 
   function renderPair(pair: AssessmentPairInput, localIndex: number): string {
     const recentContext =
@@ -1179,7 +1262,12 @@ Reply with ONLY JSON: {"isSubstantial": true/false, "isConcluded": true/false}`,
       .map((originalIndex, localIndex) => renderPair(pairs[originalIndex], localIndex))
       .join('\n\n')
 
-    const response = await ai.complete(instructionsPrefix + pairList + instructionsSuffix, { reasoningEffort: 'off' })
+    // Per-pair output ≈ 50 tokens (`{"index":N,"isSubstantial":true,"isConcluded":false}`); pad to 80.
+    const response = await ai.complete(userPrefix + pairList, {
+      systemPrompt: ASSESS_BATCH_SYSTEM,
+      reasoningEffort: 'off',
+      maxTokens: Math.min(MAX_OUTPUT_TOKENS, 64 + chunk.length * 80),
+    })
 
     try {
       const parsed = JSON.parse(stripCodeFences(response)) as { index: number; isSubstantial: boolean; isConcluded: boolean }[]

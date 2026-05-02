@@ -12,6 +12,12 @@ export interface CompleteOptions {
    * Omit to leave at the backend default.
    */
   reasoningEffort?: 'off' | 'low' | 'medium' | 'high'
+  /**
+   * Per-call output cap. vLLM uses `max_tokens` to reserve a scheduling slot per request, so a tight
+   * cap (matched to the actual JSON-output size for a given call site) lets vLLM batch more concurrent
+   * requests. Defaults to `MAX_OUTPUT_TOKENS` (off) or `MAX_OUTPUT_TOKENS_REASONING` (reasoning on).
+   */
+  maxTokens?: number
   /** Per-call request timeout in ms. Falls back to `config.ai.requestTimeoutMs`. */
   timeoutMs?: number
   /** Diagnostic: when true, dumps the full raw chat-completion JSON response to console.log. Used by llm-test. */
@@ -23,6 +29,8 @@ export interface ProviderStatus {
   reqPerMin: number
   tokPerSec: number
   reasoningTokPerSec: number
+  /** Share of prompt tokens served from vLLM's prefix cache over the rolling window, as a 0-100 percent. */
+  cacheHitPct: number
   windowMs: number
 }
 
@@ -45,6 +53,8 @@ interface ChatCompletionResponse {
     prompt_tokens?: number
     completion_tokens?: number
     completion_tokens_details?: { reasoning_tokens?: number }
+    // vLLM (with --enable-prefix-caching) reports cached prompt tokens here, mirroring the OpenAI shape.
+    prompt_tokens_details?: { cached_tokens?: number }
   }
 }
 
@@ -54,6 +64,7 @@ interface CallRecord {
   promptTokens: number
   completionTokens: number
   reasoningTokens: number
+  cachedTokens: number
 }
 
 const LLM_LOG_DIR = './llm'
@@ -67,7 +78,13 @@ export const MAX_OUTPUT_TOKENS = 4096
 export const MAX_OUTPUT_TOKENS_REASONING = 8192
 
 function maxOutputFor(opts?: CompleteOptions): number {
-  return opts?.reasoningEffort && opts.reasoningEffort !== 'off' ? MAX_OUTPUT_TOKENS_REASONING : MAX_OUTPUT_TOKENS
+  const reasoning = !!opts?.reasoningEffort && opts.reasoningEffort !== 'off'
+  const defaultCap = reasoning ? MAX_OUTPUT_TOKENS_REASONING : MAX_OUTPUT_TOKENS
+  const requested = opts?.maxTokens && opts.maxTokens > 0 ? opts.maxTokens : defaultCap
+  // Reasoning tokens count against the same output budget on vLLM's qwen3 parser, so a tight
+  // per-site cap could starve the <think> block and produce truncated/empty responses. Floor to
+  // MAX_OUTPUT_TOKENS_REASONING whenever reasoning is on, regardless of what the caller passed.
+  return reasoning ? Math.max(requested, MAX_OUTPUT_TOKENS_REASONING) : requested
 }
 
 export abstract class InferenceProvider {
@@ -157,6 +174,7 @@ export abstract class InferenceProvider {
       promptTokens: data.usage?.prompt_tokens ?? 0,
       completionTokens: data.usage?.completion_tokens ?? 0,
       reasoningTokens,
+      cachedTokens: data.usage?.prompt_tokens_details?.cached_tokens ?? 0,
     })
     this.pruneHistory(endedAt)
 
@@ -168,22 +186,27 @@ export abstract class InferenceProvider {
     const now = Date.now()
     this.pruneHistory(now)
     if (this.callHistory.length === 0) {
-      return { busyPct: 0, reqPerMin: 0, tokPerSec: 0, reasoningTokPerSec: 0, windowMs: this.config.statusWindowMs }
+      return { busyPct: 0, reqPerMin: 0, tokPerSec: 0, reasoningTokPerSec: 0, cacheHitPct: 0, windowMs: this.config.statusWindowMs }
     }
     let totalDurationMs = 0
     let totalTokens = 0
     let totalReasoningTokens = 0
+    let totalPromptTokens = 0
+    let totalCachedTokens = 0
     for (const c of this.callHistory) {
       totalDurationMs += c.endedAt - c.startedAt
       totalTokens += c.promptTokens + c.completionTokens
       totalReasoningTokens += c.reasoningTokens
+      totalPromptTokens += c.promptTokens
+      totalCachedTokens += c.cachedTokens
     }
     const windowMs = Math.min(now - this.callHistory[0].startedAt, this.config.statusWindowMs)
     const busyPct = windowMs > 0 ? Math.round((totalDurationMs / windowMs) * 100) : 0
     const reqPerMin = windowMs > 0 ? Math.round((this.callHistory.length / windowMs) * 60_000) : 0
     const tokPerSec = windowMs > 0 ? Math.round((totalTokens / windowMs) * 1000) : 0
     const reasoningTokPerSec = windowMs > 0 ? Math.round((totalReasoningTokens / windowMs) * 1000) : 0
-    return { busyPct, reqPerMin, tokPerSec, reasoningTokPerSec, windowMs: this.config.statusWindowMs }
+    const cacheHitPct = totalPromptTokens > 0 ? Math.round((totalCachedTokens / totalPromptTokens) * 100) : 0
+    return { busyPct, reqPerMin, tokPerSec, reasoningTokPerSec, cacheHitPct, windowMs: this.config.statusWindowMs }
   }
 
   /** Backend-overridable: HTTP POST to /chat/completions with timeout. */

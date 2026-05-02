@@ -34,15 +34,21 @@ Every `complete()` call writes 3 files to `llm/{YYYYMMDD}/` (gitignored): `{unix
 
 ## Metrics
 
-Each call records `{startedAt, endedAt, promptTokens, completionTokens, reasoningTokens}` in a rolling window (`ai.statusWindowMs`, default 10 min). Surfaced via `status()` as `busyPct`, `reqPerMin`, `tokPerSec`, `reasoningTokPerSec` (non-zero only for reasoning models). `reasoningTokPerSec` is shown on `/status` only when non-zero.
+Each call records `{startedAt, endedAt, promptTokens, completionTokens, reasoningTokens, cachedTokens}` in a rolling window (`ai.statusWindowMs`, default 10 min). Surfaced via `status()` as `busyPct`, `reqPerMin`, `tokPerSec`, `reasoningTokPerSec` (non-zero only for reasoning models), and `cacheHitPct` (vLLM prefix-cache share of prompt tokens; 0 on Ollama). `reasoningTokPerSec` is shown on `/status` only when non-zero.
+
+`cachedTokens` is read from `usage.prompt_tokens_details.cached_tokens` — vLLM emits this when prefix caching is on (default since 0.4). vLLM-side hit rate is also exposed via `vllm:gpu_prefix_cache_hit_rate` on the server's `/metrics` endpoint.
 
 ## Design decisions
 
 ### LLM response code-fence stripping (2026-04-10)
 Both consolidator and aggregator strip markdown code fences (` ```json ... ``` `) from LLM responses before JSON parsing via `stripCodeFences()`. Models (especially Gemma 4) wrap JSON in code fences despite explicit "no code fences" prompts. Without stripping, all `JSON.parse()` calls fail.
 
-### max_tokens = 4096 / 8192 (2026-04-10, updated 2026-04-29)
-The AI client sends `max_tokens: 4096` for non-reasoning calls and `max_tokens: 8192` when `reasoningEffort` is `'low' | 'medium' | 'high'`. Reasoning tokens count against the same output budget on vLLM's qwen3 parser (and Gemma 4 historically), so a long reasoning chain on a complex prompt could exhaust 4096 tokens before emitting any JSON, producing null/truncated responses or full 5-min timeouts. Both constants are exported (`MAX_OUTPUT_TOKENS` / `MAX_OUTPUT_TOKENS_REASONING`) and the consolidator's `inputBudget(ai, fixedOverhead, reasoningEnabled)` reserves the right one when sizing chunked prompts. Only `matchBatchAgainstTopics` passes `true` today; the other batched calls run at `reasoningEffort: 'off'` and keep the smaller reserve so chunks can stay larger. Original 4096 default came from prior Gemma 4 experimentation where 1024 was too low.
+### max_tokens = 4096 / 8192 default + per-call override (2026-04-10, updated 2026-05-02)
+The AI client defaults to `max_tokens: 4096` for non-reasoning calls and `max_tokens: 8192` when `reasoningEffort` is `'low' | 'medium' | 'high'`. Reasoning tokens count against the same output budget on vLLM's qwen3 parser (and Gemma 4 historically), so a long reasoning chain on a complex prompt could exhaust 4096 tokens before emitting any JSON, producing null/truncated responses or full 5-min timeouts. Both constants are exported (`MAX_OUTPUT_TOKENS` / `MAX_OUTPUT_TOKENS_REASONING`) and the consolidator's `inputBudget(ai, fixedOverhead, reasoningEnabled)` reserves the right one when sizing chunked prompts. Only `matchBatchAgainstTopics` passes `true` today; the other batched calls run at `reasoningEffort: 'off'` and keep the smaller reserve so chunks can stay larger.
+
+`opts.maxTokens` overrides the default per call. vLLM uses `max_tokens` to reserve a scheduling slot per request, so the tighter the cap, the more concurrent requests fit on the GPU. Every non-reasoning call site sets a tight `maxTokens` matched to its actual JSON-output size (e.g. `assessArticleBatch` batch ≈ `64 + chunk.length * 80`); reasoning sites stay at the 8192 default because the `<think>` block can be long. Caps are bounded above by `MAX_OUTPUT_TOKENS` (4096) so they never exceed the historical default — the worst case is an unchanged reservation, never a smaller one. Original 4096 default came from prior Gemma 4 experimentation where 1024 was too low.
+
+**Reasoning-on floor:** `maxOutputFor()` enforces `max(requested, MAX_OUTPUT_TOKENS_REASONING)` whenever `reasoningEffort` is anything other than `'off'`. Reasoning tokens count against the same output budget on vLLM's qwen3 parser, so a tight per-site cap with reasoning on would starve the `<think>` block and produce truncated/empty responses (a problem we hit before). The floor makes that mistake unrepresentable: pass any `maxTokens` you want for a reasoning call, the actual reservation never drops below 8192.
 
 ### vLLM auto-detection via `"auto"` sentinel (2026-04-25)
 `config.ai.model` and `config.ai.maxContextTokens` accept `"auto"` to fetch the first model's `id` and `max_model_len` from `GET /v1/models` at startup. `VllmProvider.doInit()` resolves these before the first `complete()` call. One fetch covers both fields. vLLM always includes `max_model_len`; Ollama does not — setting `"auto"` with Ollama backend throws a clear error. The `maxContextTokens` property on `InferenceProvider` is always a resolved `number` after init. Rationale: vLLM typically serves a single model and the context window is a property of the model weights, not something operators should have to look up manually.
@@ -55,3 +61,12 @@ The one place in the project where `createX()` factories are replaced with class
 
 ### Per-request timeout in `complete()` (2026-04-25)
 Every chat-completion call uses `AbortController` with `config.ai.requestTimeoutMs` (default 5 min, overridable via `opts.timeoutMs`). Previously `fetch` had no timeout — a hung backend could pin the consolidator drain silently.
+
+### Static instructions live in `systemPrompt`, not the user prompt (2026-05-02)
+Every call site declares its static instructions as a module-level `const` (`TOPIC_MATCH_SYSTEM`, `LONG_MODE_BATCH_SYSTEM`, etc.) and passes it via `opts.systemPrompt`. The user prompt carries only dynamic content (articles, topics, profile). Rationale: vLLM prefix caching reuses identical token prefixes across requests; once a call site sends a systemPrompt, the rendered `<|im_start|>system\n...<|im_end|>` block is byte-identical across calls and forms a stable cache prefix.
+
+Two rules for new call sites:
+- Treat each `*_SYSTEM` text as a versioned constant. Never construct it from a template literal containing dynamic data — a single byte change invalidates every cached entry.
+- Once a call site sends a systemPrompt, **always** send the same one. Conditionally omitting the system message changes the rendered chat template (no `system` block at all) and invalidates the prefix.
+
+Within the user prompt, place longer-stable content first. E.g. `matchBatchAgainstTopics` puts the constant article batch before the per-chunk topic list so parallel chunk siblings share the article-tokens prefix; the aggregator's relevance scorer puts the per-user preference profile before the per-tick topic list so consecutive front-page generations for the same user share the profile prefix.
