@@ -123,6 +123,12 @@
           <span class="font-mono text-sm font-semibold">{status.llm.reasoningTokPerSec} think tok/s</span>
         </div>
         {/if}
+        <div class="flex items-baseline justify-between mb-1">
+          <span class="text-sm text-stone-600 dark:text-stone-300">In flight</span>
+          <span class="font-mono text-sm font-semibold {status.llm.queueDepthNormal + status.llm.queueDepthLow > 0 ? 'text-amber-600 dark:text-amber-400' : ''}">
+            {status.llm.inFlight}/{status.llm.maxConcurrency}{#if status.llm.queueDepthNormal > 0} · +{status.llm.queueDepthNormal} queued{/if}{#if status.llm.queueDepthLow > 0} · +{status.llm.queueDepthLow} low{/if}
+          </span>
+        </div>
         <div class="flex items-baseline justify-between">
           <span class="text-sm text-stone-600 dark:text-stone-300">Prefix cache</span>
           <span class="font-mono text-sm font-semibold">{status.llm.cacheHitPct}%</span>

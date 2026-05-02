@@ -22,6 +22,11 @@ export interface CompleteOptions {
   timeoutMs?: number
   /** Diagnostic: when true, dumps the full raw chat-completion JSON response to console.log. Used by llm-test. */
   verbose?: boolean
+  /**
+   * Scheduling priority for the global concurrency gate. `'low'` yields completely to `'normal'`
+   * (may starve under sustained normal load — intentional). Default `'normal'`.
+   */
+  priority?: 'low' | 'normal'
 }
 
 export interface ProviderStatus {
@@ -32,6 +37,14 @@ export interface ProviderStatus {
   /** Share of prompt tokens served from vLLM's prefix cache over the rolling window, as a 0-100 percent. */
   cacheHitPct: number
   windowMs: number
+  /** Currently dispatched LLM requests (acquired a permit, awaiting response). */
+  inFlight: number
+  /** Normal-priority requests waiting for a permit. */
+  queueDepthNormal: number
+  /** Low-priority requests waiting for a permit (drained only when normal queue empty). */
+  queueDepthLow: number
+  /** Configured cap on in-flight requests (`config.ai.maxConcurrency`). */
+  maxConcurrency: number
 }
 
 interface ChatMessage {
@@ -77,6 +90,46 @@ export const MAX_OUTPUT_TOKENS = 4096
 /** Hard cap on output tokens when reasoning is ENABLED — reasoning tokens count against this budget on vLLM (qwen3 parser), so we double it. */
 export const MAX_OUTPUT_TOKENS_REASONING = 8192
 
+/**
+ * Process-wide concurrency gate with two priorities. Normal queue is fully drained before low queue —
+ * intentional starvation of low under sustained normal load (see docs/ai.md).
+ */
+class PriorityGate {
+  private inFlight = 0
+  private readonly normal: Array<() => void> = []
+  private readonly low: Array<() => void> = []
+  constructor(private readonly limit: number) {}
+
+  acquire(priority: 'low' | 'normal'): Promise<() => void> {
+    return new Promise((resolve) => {
+      const grant = () => {
+        this.inFlight++
+        let released = false
+        resolve(() => {
+          if (released) return
+          released = true
+          this.inFlight--
+          this.drain()
+        })
+      }
+      if (this.inFlight < this.limit) grant()
+      else (priority === 'low' ? this.low : this.normal).push(grant)
+    })
+  }
+
+  private drain() {
+    while (this.inFlight < this.limit) {
+      const next = this.normal.shift() ?? this.low.shift()
+      if (!next) return
+      next()
+    }
+  }
+
+  stats() {
+    return { inFlight: this.inFlight, queueDepthNormal: this.normal.length, queueDepthLow: this.low.length }
+  }
+}
+
 function maxOutputFor(opts?: CompleteOptions): number {
   const reasoning = !!opts?.reasoningEffort && opts.reasoningEffort !== 'off'
   const defaultCap = reasoning ? MAX_OUTPUT_TOKENS_REASONING : MAX_OUTPUT_TOKENS
@@ -91,6 +144,7 @@ export abstract class InferenceProvider {
   protected resolvedModel: string
   protected resolvedMaxContextTokens: number
   protected readonly headers: Record<string, string>
+  private readonly gate: PriorityGate
   private callHistory: CallRecord[] = []
   private initPromise?: Promise<void>
 
@@ -101,6 +155,7 @@ export abstract class InferenceProvider {
       'Content-Type': 'application/json',
       ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {}),
     }
+    this.gate = new PriorityGate(config.maxConcurrency)
   }
 
   get maxContextTokens(): number {
@@ -143,50 +198,64 @@ export abstract class InferenceProvider {
       body['reasoning_effort'] = opts.reasoningEffort
     }
 
-    const timestamp = Math.floor(Date.now() / 1000)
-    const seq = logCallSeq++
-    const startedAt = Date.now()
-    const timeoutMs = opts?.timeoutMs ?? this.config.requestTimeoutMs
+    // Acquire AFTER ensureInitialized + body assembly so the timeout (started inside fetchChatCompletion)
+    // does not tick during queue wait — a low-priority call that waits 10 minutes behind normal traffic
+    // must not spuriously time out before it gets dispatched.
+    const release = await this.gate.acquire(opts?.priority ?? 'normal')
+    try {
+      const timestamp = Math.floor(Date.now() / 1000)
+      const seq = logCallSeq++
+      const startedAt = Date.now()
+      const timeoutMs = opts?.timeoutMs ?? this.config.requestTimeoutMs
 
-    const data = await this.fetchChatCompletion(body, timeoutMs)
-    const endedAt = Date.now()
+      const data = await this.fetchChatCompletion(body, timeoutMs)
+      const endedAt = Date.now()
 
-    if (opts?.verbose) {
-      console.log('[ai] raw chat-completion response:')
-      console.log(JSON.stringify(data, null, 2))
+      if (opts?.verbose) {
+        console.log('[ai] raw chat-completion response:')
+        console.log(JSON.stringify(data, null, 2))
+      }
+
+      const msg = data.choices[0]!.message
+      const reasoning = msg.reasoning_content ?? msg.reasoning
+      // vLLM with the qwen3 parser does NOT break out reasoning_tokens in usage — it lumps them
+      // into completion_tokens. Estimate from reasoning text length (~4 chars/token) as a fallback
+      // so the rolling-window metric reflects reality on those backends.
+      const reportedReasoningTokens = data.usage?.completion_tokens_details?.reasoning_tokens ?? 0
+      const reasoningTokens = reportedReasoningTokens > 0
+        ? reportedReasoningTokens
+        : reasoning
+          ? Math.ceil(reasoning.length / 4)
+          : 0
+
+      this.callHistory.push({
+        startedAt,
+        endedAt,
+        promptTokens: data.usage?.prompt_tokens ?? 0,
+        completionTokens: data.usage?.completion_tokens ?? 0,
+        reasoningTokens,
+        cachedTokens: data.usage?.prompt_tokens_details?.cached_tokens ?? 0,
+      })
+      this.pruneHistory(endedAt)
+
+      logLlmCall(timestamp, seq, { model: this.resolvedModel, messages }, msg.content, reasoning)
+      return msg.content
+    } finally {
+      release()
     }
-
-    const msg = data.choices[0]!.message
-    const reasoning = msg.reasoning_content ?? msg.reasoning
-    // vLLM with the qwen3 parser does NOT break out reasoning_tokens in usage — it lumps them
-    // into completion_tokens. Estimate from reasoning text length (~4 chars/token) as a fallback
-    // so the rolling-window metric reflects reality on those backends.
-    const reportedReasoningTokens = data.usage?.completion_tokens_details?.reasoning_tokens ?? 0
-    const reasoningTokens = reportedReasoningTokens > 0
-      ? reportedReasoningTokens
-      : reasoning
-        ? Math.ceil(reasoning.length / 4)
-        : 0
-
-    this.callHistory.push({
-      startedAt,
-      endedAt,
-      promptTokens: data.usage?.prompt_tokens ?? 0,
-      completionTokens: data.usage?.completion_tokens ?? 0,
-      reasoningTokens,
-      cachedTokens: data.usage?.prompt_tokens_details?.cached_tokens ?? 0,
-    })
-    this.pruneHistory(endedAt)
-
-    logLlmCall(timestamp, seq, { model: this.resolvedModel, messages }, msg.content, reasoning)
-    return msg.content
   }
 
   status(): ProviderStatus {
     const now = Date.now()
     this.pruneHistory(now)
+    const gateStats = this.gate.stats()
+    const maxConcurrency = this.config.maxConcurrency
     if (this.callHistory.length === 0) {
-      return { busyPct: 0, reqPerMin: 0, tokPerSec: 0, reasoningTokPerSec: 0, cacheHitPct: 0, windowMs: this.config.statusWindowMs }
+      return {
+        busyPct: 0, reqPerMin: 0, tokPerSec: 0, reasoningTokPerSec: 0, cacheHitPct: 0,
+        windowMs: this.config.statusWindowMs,
+        ...gateStats, maxConcurrency,
+      }
     }
     let totalDurationMs = 0
     let totalTokens = 0
@@ -206,7 +275,11 @@ export abstract class InferenceProvider {
     const tokPerSec = windowMs > 0 ? Math.round((totalTokens / windowMs) * 1000) : 0
     const reasoningTokPerSec = windowMs > 0 ? Math.round((totalReasoningTokens / windowMs) * 1000) : 0
     const cacheHitPct = totalPromptTokens > 0 ? Math.round((totalCachedTokens / totalPromptTokens) * 100) : 0
-    return { busyPct, reqPerMin, tokPerSec, reasoningTokPerSec, cacheHitPct, windowMs: this.config.statusWindowMs }
+    return {
+      busyPct, reqPerMin, tokPerSec, reasoningTokPerSec, cacheHitPct,
+      windowMs: this.config.statusWindowMs,
+      ...gateStats, maxConcurrency,
+    }
   }
 
   /** Backend-overridable: HTTP POST to /chat/completions with timeout. */

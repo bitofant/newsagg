@@ -771,6 +771,7 @@ async function matchBatchAgainstTopics(
       const response = await ai.complete(userPrefix + topicList, {
         systemPrompt: TOPIC_MATCH_SYSTEM,
         reasoningEffort: 'high',
+        priority: 'low',
       })
 
       try {

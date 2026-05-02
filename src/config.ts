@@ -31,6 +31,11 @@ export interface AiConfig {
   statusWindowMs: number
   /** Per-request HTTP timeout in ms. Default: 5 minutes. */
   requestTimeoutMs: number
+  /**
+   * Max in-flight LLM requests across all priorities. Excess requests queue; low-priority calls
+   * (topic matching) wait until the normal-priority queue is empty. Default: 12 (vLLM scheduler ceiling).
+   */
+  maxConcurrency: number
 }
 
 export interface ConsolidatorConfig {
@@ -95,6 +100,7 @@ function loadConfig(): Config {
       apiKey: raw.ai?.apiKey,
       statusWindowMs: raw.ai?.statusWindowMs ?? 10 * 60 * 1000,
       requestTimeoutMs: raw.ai?.requestTimeoutMs ?? 5 * 60 * 1000,
+      maxConcurrency: raw.ai?.maxConcurrency ?? 12,
     },
     feeds: raw.feeds ?? [],
     rssPollInterval: loadRssPollInterval(raw.rssPollInterval),

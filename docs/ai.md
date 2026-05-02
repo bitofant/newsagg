@@ -12,7 +12,7 @@ LLM wrapper over OpenAI-compatible APIs (Ollama or vLLM). The only LLM caller in
 
 ## Config (`config.ai`)
 
-`backend: 'ollama' | 'vllm'`, `url`, `model`, `maxContextTokens`, optional `apiKey`, `statusWindowMs`, `requestTimeoutMs` (default 5 min — caps every chat-completion call so a hung backend surfaces fast).
+`backend: 'ollama' | 'vllm'`, `url`, `model`, `maxContextTokens`, optional `apiKey`, `statusWindowMs`, `requestTimeoutMs` (default 5 min — caps every chat-completion call so a hung backend surfaces fast), `maxConcurrency` (default 12 — caps in-flight `complete()` calls; see "Global concurrency gate" below).
 
 `model` and `maxContextTokens` accept `"auto"` to fetch from `/v1/models` at startup. vLLM serves `max_model_len` in the model list; Ollama does not — `OllamaProvider.doInit()` throws if either is `"auto"`.
 
@@ -34,7 +34,7 @@ Every `complete()` call writes 3 files to `llm/{YYYYMMDD}/` (gitignored): `{unix
 
 ## Metrics
 
-Each call records `{startedAt, endedAt, promptTokens, completionTokens, reasoningTokens, cachedTokens}` in a rolling window (`ai.statusWindowMs`, default 10 min). Surfaced via `status()` as `busyPct`, `reqPerMin`, `tokPerSec`, `reasoningTokPerSec` (non-zero only for reasoning models), and `cacheHitPct` (vLLM prefix-cache share of prompt tokens; 0 on Ollama). `reasoningTokPerSec` is shown on `/status` only when non-zero.
+Each call records `{startedAt, endedAt, promptTokens, completionTokens, reasoningTokens, cachedTokens}` in a rolling window (`ai.statusWindowMs`, default 10 min). Surfaced via `status()` as `busyPct`, `reqPerMin`, `tokPerSec`, `reasoningTokPerSec` (non-zero only for reasoning models), `cacheHitPct` (vLLM prefix-cache share of prompt tokens; 0 on Ollama), plus live gate stats `inFlight`, `queueDepthNormal`, `queueDepthLow`, `maxConcurrency`. `reasoningTokPerSec` is shown on `/status` only when non-zero.
 
 `cachedTokens` is read from `usage.prompt_tokens_details.cached_tokens` — vLLM emits this when prefix caching is on (default since 0.4). vLLM-side hit rate is also exposed via `vllm:gpu_prefix_cache_hit_rate` on the server's `/metrics` endpoint.
 
@@ -70,3 +70,10 @@ Two rules for new call sites:
 - Once a call site sends a systemPrompt, **always** send the same one. Conditionally omitting the system message changes the rendered chat template (no `system` block at all) and invalidates the prefix.
 
 Within the user prompt, place longer-stable content first. E.g. `matchBatchAgainstTopics` puts the constant article batch before the per-chunk topic list so parallel chunk siblings share the article-tokens prefix; the aggregator's relevance scorer puts the per-user preference profile before the per-tick topic list so consecutive front-page generations for the same user share the profile prefix.
+
+### Global concurrency gate with two priorities (2026-05-02)
+`InferenceProvider.complete()` acquires a permit from a process-wide `PriorityGate(config.ai.maxConcurrency)` (default 12) before dispatching the HTTP request. `opts.priority` is `'low'` or `'normal'` (default). The normal queue is fully drained before the low queue — intentional starvation under sustained normal load, since "low" means "yield to user-facing work". Today the only low-priority site is `matchBatchAgainstTopics` (topic matching of new articles); everything else (assessment, summary generation, profiler, aggregator relevance scoring, unmerge) runs at normal.
+
+The acquire happens **after** `ensureInitialized()` and after body assembly but **before** `fetchChatCompletion`, so the per-call timeout (`opts.timeoutMs` or `config.ai.requestTimeoutMs`) only starts ticking once the request is actually dispatched — a low-priority chunk that waits 10 minutes behind normal traffic won't spuriously time out before getting a permit. `ensureInitialized()` itself stays outside the gate (one-shot startup HTTP to vLLM `/v1/models`; gating it would serialize the very first concurrent burst behind initialization).
+
+The aggregator's own `config.workers` pool is independent and composes cleanly: aggregator-originated LLM calls are bounded above by `min(aggregator.workers, ai.maxConcurrency)`. Mock providers used in tests (`Singletons.set('ai', mock)`) override `complete` directly and bypass the gate.
