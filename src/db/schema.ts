@@ -105,6 +105,12 @@ export function applySchema(db: DatabaseSync): void {
   if (!topicColNames.has('substantial_event_timestamps')) {
     db.exec('ALTER TABLE topics ADD COLUMN substantial_event_timestamps TEXT')
   }
+  if (!topicColNames.has('embedding')) {
+    db.exec('ALTER TABLE topics ADD COLUMN embedding BLOB')
+  }
+  if (!topicColNames.has('embedding_model')) {
+    db.exec('ALTER TABLE topics ADD COLUMN embedding_model TEXT')
+  }
 
   // Backfill article_topics from legacy articles.topic_id column
   const atCount = (db.prepare('SELECT COUNT(*) as count FROM article_topics').get() as { count: number }).count

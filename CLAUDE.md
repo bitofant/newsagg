@@ -15,6 +15,7 @@ Each file is self-contained: spec + design decisions for that component. Read on
 | Component | Path | Doc |
 | --- | --- | --- |
 | AI / LLM wrapper | `src/ai/` | `@docs/ai.md` |
+| Embeddings (CPU ONNX, topic pre-filter) | `src/embeddings/` | `@docs/embeddings.md` |
 | Databases (news + users + signals + read state) | `src/db/` | `@docs/db.md` |
 | RSS grabber | `src/grabber/` | `@docs/grabber.md` |
 | Consolidator (topic matching, summaries, ungroup/unmerge) | `src/consolidator/` | `@docs/consolidator.md` |
@@ -25,10 +26,11 @@ Each file is self-contained: spec + design decisions for that component. Read on
 Cross-component flows worth knowing about up-front:
 
 - Grabber → Consolidator (sync `enqueue()`, async drain).
+- Consolidator → Embeddings: every topic create/regen embeds via `getEmbedder()`, stored on `topics.embedding`. Article→topic matching pre-filters via cosine before any LLM call.
 - Consolidator → Aggregator via `signal_queue` table; consolidator also rewrites users' latest `front_pages` row directly when topic-unmerging.
 - Profiler reads `users.manual_preferences` + votes, writes `users.preference_profile`. Aggregator reads `preference_profile` only.
 
-Code-comment status markers: `// IMPLEMENTED`, `// MOCKED`, `// PLANNED`. Currently outstanding: embedding-based pre-filter in the consolidator (vector similarity step before LLM matching).
+Code-comment status markers: `// IMPLEMENTED`, `// MOCKED`, `// PLANNED`. None outstanding.
 
 ## Cross-cutting design decisions
 
@@ -53,6 +55,7 @@ Node.js v22.5+ (uses `node:sqlite`), TypeScript strict + ES modules. Fastify bac
   "feeds": ["https://..."],
   "rssPollInterval": { "default": "10m", "overrides": { "<url substring>": "<dur>" } },
   "ai": { "backend", "url", "model", "maxContextTokens", "apiKey?", "statusWindowMs", "requestTimeoutMs" },
+  "embedding": { "model", "batchSize", "candidateThreshold", "candidateMinK", "candidateMaxK" },
   "consolidator": { "statusWindowMs" },
   "aggregator": { "intervalMs", "workers" },
   "server": { "port", "uiDir" },

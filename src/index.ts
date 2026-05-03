@@ -9,7 +9,7 @@ import { config } from './config.js'
 async function main() {
   const db = createDb(config.dbPath)
 
-  const consolidator = createConsolidator({ db, config: config.consolidator })
+  const consolidator = createConsolidator({ db, config: config.consolidator, embedding: config.embedding })
   const grabber = createGrabber({ feeds: config.feeds, pollInterval: config.rssPollInterval, onArticle: consolidator.enqueue })
 
   // Late-bound so the callback can reference server without a circular dependency
