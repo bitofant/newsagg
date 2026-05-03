@@ -20,6 +20,14 @@
     "requestTimeoutMs": 300000,
     "maxConcurrency": 12
   },
+  "embedding": {
+    "_comment": "CPU-side embedder used by the consolidator to pre-filter candidate topics before LLM matching. Model is downloaded from HF on first use (~23 MB quantized) and cached locally. candidateThreshold is the cosine cutoff; candidateMinK fires as a safety net when fewer topics clear the bar; candidateMaxK caps the per-article candidate set.",
+    "model": "Xenova/all-MiniLM-L6-v2",
+    "batchSize": 32,
+    "candidateThreshold": 0.35,
+    "candidateMinK": 5,
+    "candidateMaxK": 20
+  },
   "consolidator": {
     "statusWindowMs": 600000
   },

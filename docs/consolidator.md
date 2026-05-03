@@ -5,11 +5,19 @@ Topic matching, signal generation, summary generation, ungroup/unmerge/merge. Th
 ## Drain cycle
 
 - Internal async queue: `enqueue()` dedups against an in-memory pending set + DB (`articleExistsByUrl`) and buffers articles. Drain loop runs every 5s, serialized via the `processing` flag.
-- Batches up to 10 articles, matches against topics in pages of 50 (newest first). All articles are checked against every topic page (not pruned after a match), accumulating topic matches across pages — necessary because a multi-subject article may match topics on different pages.
-- Multi-topic matching: an article can match multiple existing topics (e.g. a roundup article covering several subjects).
-- Creates new topics (for unmatched articles) or appends to existing ones.
+- Batches up to 10 articles. For each batch, the **embedding pre-filter** computes article vectors on CPU, scores them against all stored topic embeddings, picks per-article candidates by threshold + min-K, and unions across the batch. The result is one small candidate set passed to a single LLM matching call.
+- Multi-topic matching: an article can match multiple existing topics (e.g. a roundup article covering several subjects). The pre-filter preserves this — candidates are returned per-article and unioned, the LLM still does the multi-label assignment.
+- Creates new topics (for unmatched articles) or appends to existing ones. New topics are embedded at create-time so the next batch can find them; updated topics re-embed at the end of every summary regen.
 - Enqueues signals to all users: `new_topic`, `added_to_topic`, `substantial_new_info`, `concluded_issue`.
 - Combined LLM assessment: substantiality + conclusion detection in one call with topic context.
+
+## Embedding pre-filter
+
+`preFilterCandidates(articles, excludeTopicId?)` is the gate in front of every `matchBatchAgainstTopics` call. CPU-side embeddings via `getEmbedder()`; details in `@docs/embeddings.md`. Per-article picking rules: take all topics with `cosine ≥ candidateThreshold`, capped at `candidateMaxK`; if fewer than `candidateMinK` clear the threshold, take the top-`candidateMinK` regardless. Per-article picks unioned across the batch, sorted by topic id ASC for partial vLLM prefix-cache reuse, returned as `Topic[]`.
+
+When the union is empty for the whole batch, the LLM matching call is skipped entirely and every article routes to new-topic creation — a free latency win on genuine-novel-story drains. The token-budget chunker inside `matchBatchAgainstTopics` is unchanged; it splits oversized unions automatically.
+
+`backfillEmbeddings()` runs at `consolidator.start()` in the background, paging through topics whose `embedding_model` doesn't match `config.embedding.model`. The first `drain()` iteration awaits the resulting promise before processing anything; subsequent drains see a resolved promise and skip the await. Server `listen()` is not blocked.
 
 ## Batched + parallel LLM dispatch
 
@@ -17,7 +25,7 @@ Inside one drain cycle, independent LLM calls fan out via `Promise.all`. The dra
 
 - **Batched calls**: assessments (all article-topic pairs), new-topic summaries (all unmatched articles), summary regenerations (all topics needing one) each collapse into a single batched LLM call (or N chunked calls if token-budgeted) with a single-item fast path.
 - **Token-budgeted chunking**: every batched call estimates tokens (~4 chars/token) against `ai.maxContextTokens - MAX_OUTPUT_TOKENS - overhead - safety_margin`, accumulates greedily, fires when budget is hit. If a chunk ends up with one item, the function's single-item fast path is used.
-- **Parallel dispatch**: paginated topic-matching pages, token-budget chunks within each batched function, and phase-4 (regen existing summaries) + phase-5 (new-topic summaries) all run concurrently.
+- **Parallel dispatch**: token-budget chunks within each batched function and phase-4 (regen existing summaries) + phase-5 (new-topic summaries) run concurrently.
 
 Sized for vLLM's continuous batching, where concurrent requests share GPU time efficiently.
 
@@ -34,7 +42,7 @@ When `substantial_new_info` is detected, the topic's read flag is removed for al
 
 ## Article ungrouping
 
-`ungroupArticle(articleId, topicId)` removes an article from a topic and re-classifies it via the same paginated LLM matching (excluding the source topic). Falls back to creating a new standalone topic if no match found. Cleans up empty topics.
+`ungroupArticle(articleId, topicId)` removes an article from a topic and re-classifies it via the same embedding-pre-filter + LLM matching used by the drain (excluding the source topic id). Falls back to creating a new standalone topic if no match found, embedded immediately. Cleans up empty topics.
 
 ## Topic unmerging
 
@@ -68,14 +76,10 @@ Synchronous (sub-second) via `POST /api/topics/:id/merge` with `{ intoTopicId }`
 
 Each drain records `{startedAt, endedAt, articleCount}` in a rolling window (size `consolidator.statusWindowMs`), surfaced via `status()` as `estimatedBehindMs` (buffer depth × avg ms/article). LLM busy % is tracked separately in `src/ai/`, not here, because other components also consume LLM time.
 
-## Planned
-
-- **Embedding-based pre-filter** (`src/consolidator/index.ts:18`) — fast vector similarity step to narrow candidate topics before the LLM matching call.
-
 ## Design decisions
 
-### Batched paginated topic matching (2026-04-07, updated 2026-04-14)
-The consolidator matches up to 10 articles at a time against topics in pages of 50, ordered by `created_at DESC` (newest first). All articles are checked against every topic page (not pruned after a match), accumulating topic matches across pages — necessary because a multi-subject article may match topics on different pages. Articles with no matches after all pages get new topics. Keeps prompt size bounded regardless of how many topics accumulate.
+### Embedding pre-filter replaces paginated topic matching (2026-05-03)
+Original matcher fanned out one LLM call per page of 50 topics; with ~1.4k topics that's ~28 parallel calls per 10-article drain at ~560k input tokens total. The pre-filter (`preFilterCandidates`, see `@docs/embeddings.md`) embeds articles on CPU, cosine-scores against all topic embeddings (brute-force, sub-millisecond at this scale), keeps per-article candidates by `threshold + min-K + max-K`, unions across the batch, hands one small candidate set to a single LLM call. Per-batch input drops to ~3k tokens, the LLM still does the multi-label classification — just on a useful subset. Trade: the previous architecture's deterministic 50-topic prefix-cache pages are gone, candidate sets are now article-content-driven and vary per drain. Net throughput is dramatically better because token volume reduction dominates cache hit rate at our scale; some prefix-cache hits remain opportunistically (system prompt is byte-stable, intra-call article suffix is byte-stable, candidate union is sorted by topic id so consecutive overlapping unions share leading prefix). Threshold + min-K rather than fixed top-K ensures novel-story articles still get a fair LLM look at the closest existing topics rather than the pre-filter making the no-match call alone; an empty candidate set across the whole batch skips the LLM call entirely and routes to new-topic creation. New topics are embedded at create-time so the very next batch can find them; topics re-embed on every summary regen so the embedding tracks the topic's current state, not its origin description. Removed at the same time: `db.news.listTopicsPaginated` and the `regenerateTopicSummary` single-topic wrapper, both unused after the pre-filter integration.
 
 ### Persistent topic summaries over per-generation LLM headlines (2026-04-13)
 Instead of generating headlines and summaries via LLM at front-page time (feasible for 8 sections but not for 100), topic summaries are generated once by the consolidator and stored in `topics.summary`. Created when a topic reaches 2+ articles; regenerated on `substantial_new_info`. Single-article topics use the article's own text. The aggregator uses `topic.title` as the headline. Rationale: decouples summary quality from front-page generation speed; avoids 10+ sequential LLM calls per front page.

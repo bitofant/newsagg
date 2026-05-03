@@ -4,6 +4,7 @@ import { resolve } from 'node:path'
 export interface Config {
   dbPath: string
   ai: AiConfig
+  embedding: EmbeddingConfig
   feeds: string[]
   rssPollInterval: RssPollIntervalConfig
   consolidator: ConsolidatorConfig
@@ -41,6 +42,19 @@ export interface AiConfig {
 export interface ConsolidatorConfig {
   /** Rolling window (ms) for processing activity metrics on /status. Default: 10 minutes. */
   statusWindowMs: number
+}
+
+export interface EmbeddingConfig {
+  /** Hugging Face model id; loaded once on first use into a CPU ONNX runtime. Stored alongside each topic embedding so a model swap triggers a full re-backfill. */
+  model: string
+  /** Max items per `embedder.embed()` ONNX call. Bigger = better throughput, more peak RAM. */
+  batchSize: number
+  /** Cosine threshold for treating a topic as a candidate for an article. Tuned empirically; raise to be stricter, lower to widen. */
+  candidateThreshold: number
+  /** If fewer than this many topics clear the threshold for a given article, take the top-N by score regardless. Safety net for novel-story articles. */
+  candidateMinK: number
+  /** Cap on per-article candidates after threshold filtering. Prevents prompt blow-up when an article is broadly similar to many topics. */
+  candidateMaxK: number
 }
 
 export interface AggregatorConfig {
@@ -101,6 +115,13 @@ function loadConfig(): Config {
       statusWindowMs: raw.ai?.statusWindowMs ?? 10 * 60 * 1000,
       requestTimeoutMs: raw.ai?.requestTimeoutMs ?? 5 * 60 * 1000,
       maxConcurrency: raw.ai?.maxConcurrency ?? 12,
+    },
+    embedding: {
+      model: raw.embedding?.model ?? 'Xenova/all-MiniLM-L6-v2',
+      batchSize: raw.embedding?.batchSize ?? 32,
+      candidateThreshold: raw.embedding?.candidateThreshold ?? 0.35,
+      candidateMinK: raw.embedding?.candidateMinK ?? 5,
+      candidateMaxK: raw.embedding?.candidateMaxK ?? 20,
     },
     feeds: raw.feeds ?? [],
     rssPollInterval: loadRssPollInterval(raw.rssPollInterval),

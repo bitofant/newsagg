@@ -1,16 +1,37 @@
 import { getAi, type InferenceProvider } from '../ai/index.js'
 import { MAX_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS_REASONING } from '../ai/provider.js'
-import type { ConsolidatorConfig } from '../config.js'
+import type { ConsolidatorConfig, EmbeddingConfig } from '../config.js'
 import type { Db } from '../db/index.js'
 import type { RawArticle } from '../grabber/index.js'
 import type { Article, Topic } from '../db/news.js'
 import type { FrontPage, FrontPageSection } from '../aggregator/index.js'
+import { getEmbedder, type Embedder } from '../embeddings/index.js'
 
-const TOPIC_PAGE_SIZE = 50
 const ARTICLE_BATCH_SIZE = 10
 const DRAIN_INTERVAL_MS = 5_000
 /** A topic switches from prose-only summary to summary+bullets format once it has had this many `substantial_new_info` events. */
 const BULLETS_THRESHOLD = 2
+
+/** Canonical text used to embed a topic. Must be deterministic across create-time and regen-time so the same topic content always embeds the same way. */
+function topicEmbedSource(t: Topic): string {
+  const parts = [t.title, t.description]
+  if (t.summary) parts.push(t.summary)
+  if (t.bullets && t.bullets.length > 0) parts.push(t.bullets.join('. '))
+  return parts.join('. ')
+}
+
+/** Canonical text used to embed an article at match time. The model truncates around 256 tokens internally. */
+function articleEmbedSource(a: RawArticle): string {
+  return `${a.title}. ${a.text.slice(0, 500)}`
+}
+
+/** Cosine similarity for L2-normalized vectors. */
+function dot(a: Float32Array, b: Float32Array): number {
+  let s = 0
+  const n = Math.min(a.length, b.length)
+  for (let i = 0; i < n; i++) s += a[i]! * b[i]!
+  return s
+}
 
 /** Slack for tokenization inaccuracy and unexpected prompt expansion. */
 const BUDGET_SAFETY_MARGIN = 256
@@ -79,14 +100,23 @@ export interface Consolidator {
   stop(): void
 }
 
-// IMPLEMENTED: batched topic matching with paginated topics, internal queue, concluded_issue detection
-// PLANNED: embedding-based pre-filter
-export function createConsolidator({ db, config }: { db: Db; config: ConsolidatorConfig }): Consolidator {
+// IMPLEMENTED: batched topic matching with embedding pre-filter, internal queue, concluded_issue detection
+export function createConsolidator({
+  db,
+  config,
+  embedding,
+}: {
+  db: Db
+  config: ConsolidatorConfig
+  embedding: EmbeddingConfig
+}): Consolidator {
   const buffer: RawArticle[] = []
   const pendingUrls = new Set<string>()
   const pendingRegenTopicIds = new Set<number>()
   let timer: ReturnType<typeof setInterval> | null = null
   let processing = false
+  /** First-pass embedding backfill for topics missing/mismatched embeddings. The very first drain awaits this; subsequent drains read freely. */
+  let backfillReady: Promise<void> | null = null
   const batchHistory: { startedAt: number; endedAt: number; articleCount: number }[] = []
 
   function enqueue(article: RawArticle) {
@@ -101,9 +131,95 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
     pendingRegenTopicIds.add(topicId)
   }
 
+  async function embedAndStoreTopicsByIds(embedder: Embedder, ids: number[]): Promise<void> {
+    if (ids.length === 0) return
+    const topics = db.news.listTopicsByIds(ids)
+    if (topics.length === 0) return
+    const vecs = await embedder.embed(topics.map(topicEmbedSource))
+    for (let i = 0; i < topics.length; i++) {
+      db.news.updateTopicEmbedding(topics[i]!.id, vecs[i]!, embedding.model)
+    }
+  }
+
+  /**
+   * Wraps `regenerateTopicSummaries` with a re-embed of every touched topic. Keeps stored embeddings
+   * in sync with the topic's current summary/bullets, since `topicEmbedSource` includes both.
+   */
+  async function regenerateAndEmbed(ai: InferenceProvider, ids: number[]): Promise<void> {
+    if (ids.length === 0) return
+    await regenerateTopicSummaries(ai, db, ids)
+    await embedAndStoreTopicsByIds(getEmbedder(), ids)
+  }
+
+  /**
+   * Per-batch pre-filter. For each article, score every topic embedding by cosine and pick:
+   *   - all topics with `cosine >= candidateThreshold`, capped at `candidateMaxK`, OR
+   *   - if fewer than `candidateMinK` clear the threshold, the top-`candidateMinK` regardless of score
+   *     (safety net so genuinely-novel-story articles still get a fair LLM look).
+   * Per-article picks are unioned across the batch and sorted by topic id ASC for partial vLLM
+   * prefix-cache benefit on consecutive batches whose unions overlap.
+   */
+  async function preFilterCandidates(articles: RawArticle[], excludeTopicId?: number): Promise<Topic[]> {
+    if (articles.length === 0) return []
+    const embedder = getEmbedder()
+    const articleVecs = await embedder.embed(articles.map(articleEmbedSource))
+    const topicEmbs = db.news.listAllTopicEmbeddings(embedding.model)
+    if (topicEmbs.length === 0) return []
+
+    const candidateIds = new Set<number>()
+    for (const av of articleVecs) {
+      const scored: Array<{ id: number; score: number }> = []
+      for (const { id, embedding: tv } of topicEmbs) {
+        if (excludeTopicId !== undefined && id === excludeTopicId) continue
+        scored.push({ id, score: dot(av, tv) })
+      }
+      scored.sort((a, b) => b.score - a.score)
+      const above = scored.filter((s) => s.score >= embedding.candidateThreshold)
+      const taken =
+        above.length >= embedding.candidateMinK
+          ? above.slice(0, embedding.candidateMaxK)
+          : scored.slice(0, embedding.candidateMinK)
+      for (const t of taken) candidateIds.add(t.id)
+    }
+    if (candidateIds.size === 0) return []
+    const ids = [...candidateIds].sort((a, b) => a - b)
+    return db.news.listTopicsByIds(ids)
+  }
+
+  async function backfillEmbeddings(): Promise<void> {
+    const total = db.news.topicsMissingEmbeddingCount(embedding.model)
+    if (total === 0) {
+      console.log(`[embed] backfill: 0 topics need embeddings (model ${embedding.model})`)
+      return
+    }
+    console.log(`[embed] backfill: ${total} topic(s) need embeddings (model ${embedding.model})`)
+    const embedder = getEmbedder()
+    const startedAt = Date.now()
+    let done = 0
+    while (true) {
+      const page = db.news.listTopicsMissingEmbedding(embedding.model, embedding.batchSize, 0)
+      if (page.length === 0) break
+      const vecs = await embedder.embed(page.map(topicEmbedSource))
+      for (let i = 0; i < page.length; i++) {
+        db.news.updateTopicEmbedding(page[i]!.id, vecs[i]!, embedding.model)
+      }
+      done += page.length
+      console.log(`[embed] backfilled ${done}/${total}`)
+    }
+    console.log(`[embed] backfill complete: ${done} topic(s) in ${Date.now() - startedAt}ms`)
+  }
+
   async function drain() {
     if (processing) return
     if (buffer.length === 0 && pendingRegenTopicIds.size === 0) return
+    if (backfillReady) {
+      // Block the first drain on initial embedding backfill so the pre-filter runs against complete
+      // topic coverage. Subsequent drains see a resolved promise (effectively a no-op await) and we
+      // null it out so the cost is paid exactly once.
+      const ready = backfillReady
+      backfillReady = null
+      await ready
+    }
     processing = true
     try {
       if (buffer.length > 0) {
@@ -114,6 +230,11 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
         const fresh = batch.filter((a) => !db.news.articleExistsByUrl(a.url))
         if (fresh.length > 0) {
           const ai = getAi()
+          // Resolve "auto" config (max_model_len) before any chunking — `inputBudget` reads
+          // `ai.maxContextTokens`, which returns 0 until `doInit()` has run. Without this prime
+          // step, the very first batch on a cold process chunks against MIN_INPUT_BUDGET (512)
+          // and produces tiny topic-chunks that can't fill a vLLM prefix-cache block.
+          await ai.ensureInitialized()
           const startedAt = Date.now()
           await processBatch(ai, fresh)
           const endedAt = Date.now()
@@ -131,8 +252,9 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
         pendingRegenTopicIds.clear()
         try {
           const ai = getAi()
+          await ai.ensureInitialized()
           const startedAt = Date.now()
-          await regenerateTopicSummaries(ai, db, ids)
+          await regenerateAndEmbed(ai, ids)
           console.log(`[consolidator] background regen for ${ids.length} topic(s) in ${Date.now() - startedAt}ms`)
         } catch (err) {
           console.error('[consolidator] background regen error:', err)
@@ -146,23 +268,20 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
   }
 
   async function processBatch(ai: InferenceProvider, articles: RawArticle[]): Promise<void> {
-    const totalTopics = db.news.topicCount()
-
-    // Collect topic pages first (sync DB calls), then fan out matching across pages in parallel.
-    const topicPages: Topic[][] = []
-    for (let offset = 0; offset < totalTopics; offset += TOPIC_PAGE_SIZE) {
-      const page = db.news.listTopicsPaginated(TOPIC_PAGE_SIZE, offset)
-      if (page.length === 0) break
-      topicPages.push(page)
-    }
-
-    const pageResults = await Promise.all(
-      topicPages.map((page) => matchBatchAgainstTopics(ai, articles, page)),
+    // Embedding pre-filter: rank all topics by cosine vs each article's embedding, keep the union of
+    // per-article candidates, hand a single small candidate set to the LLM matcher. Replaces the
+    // previous "page through every topic 50 at a time" loop. The token-budget chunker inside
+    // `matchBatchAgainstTopics` will further split if the union somehow grows past one prompt.
+    const candidates = await preFilterCandidates(articles)
+    console.log(
+      `[match] candidates for batch of ${articles.length} article(s): ${candidates.length} unique topic(s)`,
     )
 
-    // Accumulate matched topics per article across all pages
+    // Accumulate matched topics per article. With zero candidates we skip the LLM entirely and route
+    // every article to new-topic creation (the genuine-novel-story path).
     const matchesByIndex = new Map<number, Topic[]>()
-    for (const results of pageResults) {
+    if (candidates.length > 0) {
+      const results = await matchBatchAgainstTopics(ai, articles, candidates)
       for (const { articleIndex, topics } of results) {
         const existing = matchesByIndex.get(articleIndex) ?? []
         existing.push(...topics)
@@ -244,7 +363,7 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
 
     const [, newTopicInfos] = await Promise.all([
       topicsNeedingSummary.length > 0
-        ? regenerateTopicSummaries(ai, db, topicsNeedingSummary)
+        ? regenerateAndEmbed(ai, topicsNeedingSummary)
         : Promise.resolve(),
       unmatchedArticles.length > 0
         ? generateTopicSummaries(ai, unmatchedArticles)
@@ -252,15 +371,19 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
     ])
 
     if (unmatchedArticles.length > 0) {
+      // Create all new topics first, then embed them in a single batched call before linking
+      // articles + signals. Embedding at create-time (rather than waiting for first regen at 2+
+      // articles) means novel-story articles in the *next* batch can find these as candidates.
+      const newTopics: Topic[] = newTopicInfos.map((info) => db.news.createTopic(info.title, info.description))
+      await embedAndStoreTopicsByIds(getEmbedder(), newTopics.map((t) => t.id))
       for (let i = 0; i < unmatchedArticles.length; i++) {
-        const info = newTopicInfos[i]
-        const topic = db.news.createTopic(info.title, info.description)
+        const topic = newTopics[i]!
         const saved = db.news.addArticle({
           topicIds: [topic.id],
-          source: unmatchedArticles[i].source,
-          url: unmatchedArticles[i].url,
-          title: unmatchedArticles[i].title,
-          text: unmatchedArticles[i].text,
+          source: unmatchedArticles[i]!.source,
+          url: unmatchedArticles[i]!.url,
+          title: unmatchedArticles[i]!.title,
+          text: unmatchedArticles[i]!.text,
         })
         db.users.enqueueSignalForAllUsers({ type: 'new_topic', topicId: topic.id, articleId: saved.id })
       }
@@ -272,23 +395,19 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
     if (!article) throw new Error(`Article ${articleId} not found`)
 
     const ai = getAi()
+    await ai.ensureInitialized()
     db.news.unlinkArticleFromTopic(articleId, topicId)
 
-    // Re-classify: run paginated matching excluding the old topic
+    // Re-classify: pre-filter by embedding similarity, then one LLM matching call against the
+    // candidate set (excluding the source topic).
     const asRaw: RawArticle = { title: article.title, text: article.text, source: article.source, url: article.url }
-    const totalTopics = db.news.topicCount()
-    let offset = 0
+    const candidates = await preFilterCandidates([asRaw], topicId)
     const matchedTopics: Topic[] = []
-
-    while (offset < totalTopics) {
-      const topicPage = db.news.listTopicsPaginated(TOPIC_PAGE_SIZE, offset).filter((t) => t.id !== topicId)
-      if (topicPage.length > 0) {
-        const results = await matchBatchAgainstTopics(ai, [asRaw], topicPage)
-        for (const { topics } of results) {
-          matchedTopics.push(...topics)
-        }
+    if (candidates.length > 0) {
+      const results = await matchBatchAgainstTopics(ai, [asRaw], candidates)
+      for (const { topics } of results) {
+        matchedTopics.push(...topics)
       }
-      offset += TOPIC_PAGE_SIZE
     }
 
     const newTopicIds: number[] = []
@@ -300,14 +419,15 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
         db.users.enqueueSignalForAllUsers({ type: 'added_to_topic', topicId: topic.id, articleId })
         const count = db.news.getArticleCountByTopic(topic.id)
         if (count >= 2 && !topic.summary) {
-          await regenerateTopicSummary(ai, db, topic.id)
+          await regenerateAndEmbed(ai, [topic.id])
         }
         newTopicIds.push(topic.id)
       }
     } else {
-      // No match — create standalone topic
+      // No match — create standalone topic and embed it so future batches can find it.
       const { title, description } = await generateTopicSummary(ai, asRaw)
       const newTopic = db.news.createTopic(title, description)
+      await embedAndStoreTopicsByIds(getEmbedder(), [newTopic.id])
       db.news.linkArticleToTopic(articleId, newTopic.id)
       db.users.enqueueSignalForAllUsers({ type: 'new_topic', topicId: newTopic.id, articleId })
       newTopicIds.push(newTopic.id)
@@ -315,7 +435,7 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
 
     // Update legacy topic_id to first new topic
     if (newTopicIds.length > 0) {
-      db.news.linkArticleToTopic(articleId, newTopicIds[0])
+      db.news.linkArticleToTopic(articleId, newTopicIds[0]!)
     }
 
     // Clean up old topic
@@ -323,7 +443,7 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
     if (oldCount === 0) {
       db.news.deleteTopic(topicId)
     } else if (oldCount >= 2) {
-      await regenerateTopicSummary(ai, db, topicId)
+      await regenerateAndEmbed(ai, [topicId])
     }
 
     return { newTopicIds }
@@ -339,6 +459,7 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
     const startedAt = Date.now()
 
     const ai = getAi()
+    await ai.ensureInitialized()
     const llmStart = Date.now()
     const groups = await splitTopicViaLlm(ai, oldTopic, articles)
     console.log(`[unmerge] split (phase 1 + phase 2) returned ${groups.length} groups total in ${Date.now() - llmStart}ms`)
@@ -391,6 +512,10 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
     } else {
       console.log(`[unmerge] no summaries to regenerate (all new topics single-article)`)
     }
+
+    // Embed every new topic in one batched call. Multi-article topics pick up the regenerated summary
+    // (via topicEmbedSource), single-article ones embed off title+description.
+    await embedAndStoreTopicsByIds(getEmbedder(), newTopics.map((t) => t.id))
 
     // Migrate read state and rewrite affected front pages BEFORE deleting the old topic.
     db.users.replaceReadTopic(topicId, newTopics.map((t) => t.id))
@@ -567,6 +692,11 @@ export function createConsolidator({ db, config }: { db: Db; config: Consolidato
       return { bufferDepth: buffer.length, processing, pendingRegens: pendingRegenTopicIds.size, estimatedBehindMs }
     },
     start() {
+      // Kick off the embedding backfill in the background. The first drain awaits this; we don't
+      // block server.listen() or other startup work behind it.
+      backfillReady = backfillEmbeddings().catch((err) => {
+        console.error('[embed] backfill failed:', err)
+      })
       timer = setInterval(drain, DRAIN_INTERVAL_MS)
     },
     stop() {
@@ -754,21 +884,22 @@ async function matchBatchAgainstTopics(
   const articleList = articles
     .map((a, i) => `${i}: ${a.title} — ${a.text.slice(0, 200)}`)
     .join('\n')
-
-  // Articles are constant across topic-chunk siblings — placing them first in the user prompt makes
-  // them part of the cacheable prefix shared by the parallel chunks of one batch.
-  const userPrefix = `New articles:\n${articleList}\n\nExisting topics:\n`
-  const fixedOverhead = estimateTokens(TOPIC_MATCH_SYSTEM) + estimateTokens(userPrefix)
+  const articleSuffix = `\n\nNew articles:\n${articleList}`
 
   const renderedTopics = topics.map((t) => `${t.id}: ${t.title} — ${t.description}`)
   // Matching uses reasoningEffort: 'high' — reserve the larger output budget so chunking accounts for it.
+  const fixedOverhead = estimateTokens(TOPIC_MATCH_SYSTEM) + estimateTokens(articleSuffix) + 8 // "Existing topics:\n"
   const chunks = chunkByTokens(topics, renderedTopics, inputBudget(ai, fixedOverhead, true))
 
   // Fan out chunks in parallel; merge sequentially after.
+  // Topic page goes first: `processBatch` re-runs every batch in a drain against the same paginated
+  // topic pages, so the rendered topic chunk is byte-identical across batches. On vLLM block sizes
+  // ≥ ~1500 tokens (e.g. hybrid attention/Mamba models like Qwen3.6 → 1568), only a >=1-block stable
+  // prefix produces cache hits; an article-first layout never fills one block. See docs/ai.md.
   const chunkResults = await Promise.all(
     chunks.map(async (chunk): Promise<BatchMatchEntry[]> => {
       const topicList = chunk.map((t) => `${t.id}: ${t.title} — ${t.description}`).join('\n')
-      const response = await ai.complete(userPrefix + topicList, {
+      const response = await ai.complete(`Existing topics:\n${topicList}${articleSuffix}`, {
         systemPrompt: TOPIC_MATCH_SYSTEM,
         reasoningEffort: 'high',
         priority: 'low',
@@ -930,11 +1061,6 @@ async function regenerateTopicSummaries(ai: InferenceProvider, db: Db, topicIds:
     shortContexts.length > 0 ? regenerateShortMode(ai, db, shortContexts) : Promise.resolve(),
     longContexts.length > 0 ? regenerateLongMode(ai, db, longContexts) : Promise.resolve(),
   ])
-}
-
-/** Single-topic regen wrapper (used by ungroupArticle) — dispatches by mode internally. */
-async function regenerateTopicSummary(ai: InferenceProvider, db: Db, topicId: number): Promise<void> {
-  return regenerateTopicSummaries(ai, db, [topicId])
 }
 
 const SHORT_MODE_SINGLE_SYSTEM = `You are a news editor. Write a concise 2-3 sentence summary of the news topic in the user's message based on the latest articles.

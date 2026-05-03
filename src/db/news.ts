@@ -81,11 +81,11 @@ export interface NewArticle {
 export interface NewsDb {
   /** Returns all topics with terse descriptions — used by consolidator for matching */
   listTopics(): Topic[]
-  /** Paginated topics ordered by created_at DESC, for batched consolidator matching */
-  listTopicsPaginated(limit: number, offset: number): Topic[]
   topicCount(): number
   getTopic(id: number): Topic | null
   createTopic(title: string, description: string): Topic
+  /** Look up topics by id list. Order of result follows the input order; missing ids are skipped. */
+  listTopicsByIds(ids: number[]): Topic[]
   updateTopicTimestamp(id: number): void
   articleExistsByUrl(url: string): boolean
   addArticle(article: NewArticle): Article
@@ -104,6 +104,26 @@ export interface NewsDb {
   unlinkArticleFromTopic(articleId: number, topicId: number): void
   deleteTopic(id: number): void
   totalArticleCount(): number
+  /** Write the embedding bytes for a topic, tagged with the model name that produced it. */
+  updateTopicEmbedding(topicId: number, embedding: Float32Array, model: string): void
+  /** All topics that have an embedding from the given model. Brute-forced over for cosine pre-filter. */
+  listAllTopicEmbeddings(model: string): Array<{ id: number; embedding: Float32Array }>
+  /** Topics whose stored embedding is missing or was produced by a different model. Used by backfill. */
+  listTopicsMissingEmbedding(model: string, limit: number, offset: number): Topic[]
+  topicsMissingEmbeddingCount(model: string): number
+}
+
+function float32ArrayToBlob(arr: Float32Array): Buffer {
+  return Buffer.from(arr.buffer, arr.byteOffset, arr.byteLength)
+}
+
+function blobToFloat32Array(blob: Uint8Array): Float32Array {
+  // Copy into a fresh, 4-byte-aligned ArrayBuffer. The Uint8Array we get back from node:sqlite is
+  // not guaranteed to start at a 4-byte-aligned offset within its underlying ArrayBuffer, so wrapping
+  // it directly as a Float32Array would throw on some inputs.
+  const aligned = new ArrayBuffer(blob.byteLength)
+  new Uint8Array(aligned).set(blob)
+  return new Float32Array(aligned)
 }
 
 // IMPLEMENTED
@@ -112,12 +132,6 @@ export function createNewsDb(db: DatabaseSync): NewsDb {
     listTopics() {
       return (
         db.prepare(`SELECT ${TOPIC_COLUMNS} FROM topics ORDER BY updated_at DESC`).all() as unknown as TopicRow[]
-      ).map(rowToTopic)
-    },
-
-    listTopicsPaginated(limit, offset) {
-      return (
-        db.prepare(`SELECT ${TOPIC_COLUMNS} FROM topics ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(limit, offset) as unknown as TopicRow[]
       ).map(rowToTopic)
     },
 
@@ -296,6 +310,58 @@ export function createNewsDb(db: DatabaseSync): NewsDb {
           db.prepare('UPDATE articles SET topic_id = ? WHERE id = ?').run(remaining.topic_id, articleId)
         }
       }
+    },
+
+    listTopicsByIds(ids) {
+      if (ids.length === 0) return []
+      const placeholders = ids.map(() => '?').join(',')
+      const rows = db
+        .prepare(`SELECT ${TOPIC_COLUMNS} FROM topics WHERE id IN (${placeholders})`)
+        .all(...ids) as unknown as TopicRow[]
+      const byId = new Map(rows.map((r) => [r.id, rowToTopic(r)] as const))
+      const out: Topic[] = []
+      for (const id of ids) {
+        const t = byId.get(id)
+        if (t) out.push(t)
+      }
+      return out
+    },
+
+    updateTopicEmbedding(topicId, embedding, model) {
+      db.prepare('UPDATE topics SET embedding = ?, embedding_model = ? WHERE id = ?').run(
+        float32ArrayToBlob(embedding),
+        model,
+        topicId,
+      )
+    },
+
+    listAllTopicEmbeddings(model) {
+      const rows = db
+        .prepare('SELECT id, embedding FROM topics WHERE embedding IS NOT NULL AND embedding_model = ?')
+        .all(model) as Array<{ id: number; embedding: Uint8Array }>
+      return rows.map((r) => ({ id: r.id, embedding: blobToFloat32Array(r.embedding) }))
+    },
+
+    listTopicsMissingEmbedding(model, limit, offset) {
+      return (
+        db
+          .prepare(
+            `SELECT ${TOPIC_COLUMNS} FROM topics
+             WHERE embedding IS NULL OR embedding_model IS NULL OR embedding_model != ?
+             ORDER BY id ASC LIMIT ? OFFSET ?`,
+          )
+          .all(model, limit, offset) as unknown as TopicRow[]
+      ).map(rowToTopic)
+    },
+
+    topicsMissingEmbeddingCount(model) {
+      const row = db
+        .prepare(
+          `SELECT COUNT(*) as count FROM topics
+           WHERE embedding IS NULL OR embedding_model IS NULL OR embedding_model != ?`,
+        )
+        .get(model) as { count: number }
+      return row.count
     },
 
     deleteTopic(id) {

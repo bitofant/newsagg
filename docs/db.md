@@ -10,6 +10,8 @@ Column mapping snake_case (SQL) → camelCase (TS) is done at the DB layer bound
   - `summary` (string): LLM-generated 2-3 sentence summary, created when topic reaches 2+ articles, regenerated on `substantial_new_info`.
   - `bullets`, `new_info` (JSON array of strings, nullable): used by long-running topics that have crossed the bullets threshold. `bullets` is the running list of material developments; `new_info` is what's materially new since the previous regeneration (rendered with a "NEW:" prefix in the UI).
   - `substantial_event_timestamps` (JSON array of unix-ms numbers, nullable, treated as `[]` when null): one timestamp appended per `substantial_new_info` event. Length doubles as the threshold counter for switching prose-only → bullets format; the values themselves are also useful for surfacing recency in the UI.
+  - `embedding` (BLOB, nullable): little-endian Float32 bytes from the consolidator's pre-filter embedder. Refreshed at every `createTopic` and at the end of every `regenerateTopicSummaries`. See `@docs/embeddings.md`.
+  - `embedding_model` (TEXT, nullable): the `Embedder.model` value that produced the bytes. Topics whose stored model doesn't match `config.embedding.model` are treated as missing and re-embedded by the backfill loop on next startup, so model swaps never silently produce mixed-vector cosines.
 - **`articles`** — title, text, timestamp, source, url. `articles.topic_id` column remains (SQLite can't drop columns) but is vestigial.
 - **`article_topics`** — junction table for the many-to-many article↔topic relationship (see decision below). All queries use this; the legacy `articles.topic_id` is unused.
 
