@@ -6,6 +6,7 @@ import type { RawArticle } from '../grabber/index.js'
 import type { Article, Topic } from '../db/news.js'
 import type { FrontPage, FrontPageSection } from '../aggregator/index.js'
 import { getEmbedder, type Embedder } from '../embeddings/index.js'
+import { dot } from '../embeddings/cosine.js'
 
 const ARTICLE_BATCH_SIZE = 10
 const DRAIN_INTERVAL_MS = 5_000
@@ -23,14 +24,6 @@ function topicEmbedSource(t: Topic): string {
 /** Canonical text used to embed an article at match time. The model truncates around 256 tokens internally. */
 function articleEmbedSource(a: RawArticle): string {
   return `${a.title}. ${a.text.slice(0, 500)}`
-}
-
-/** Cosine similarity for L2-normalized vectors. */
-function dot(a: Float32Array, b: Float32Array): number {
-  let s = 0
-  const n = Math.min(a.length, b.length)
-  for (let i = 0; i < n; i++) s += a[i]! * b[i]!
-  return s
 }
 
 /** Slack for tokenization inaccuracy and unexpected prompt expansion. */

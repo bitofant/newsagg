@@ -174,6 +174,52 @@ export async function pollUnmergeResult(topicId: number, waitSec = 30): Promise<
   return res.json() as Promise<UnmergeResult>
 }
 
+export interface DupeCandidate {
+  topicIdA: number
+  topicIdB: number
+  similarity: number
+  createdAt: number
+  titleA: string
+  titleB: string
+  articleCountA: number
+  articleCountB: number
+}
+
+export interface DupeFinderStatus {
+  state: 'idle' | 'running' | 'done' | 'error'
+  startedAt?: number
+  completedAt?: number
+  candidateCount?: number
+  error?: string
+}
+
+export async function listDupeCandidates(): Promise<{ candidates: DupeCandidate[]; status: DupeFinderStatus }> {
+  const res = await fetch(`${BASE}/dupes`, { headers: authHeaders() })
+  if (!res.ok) throw new Error('Failed to load dupe candidates')
+  return res.json() as Promise<{ candidates: DupeCandidate[]; status: DupeFinderStatus }>
+}
+
+export async function startDupeGeneration(): Promise<{ ok: boolean; alreadyRunning?: boolean }> {
+  const res = await fetch(`${BASE}/dupes/generate`, { method: 'POST', headers: authHeaders() })
+  if (!res.ok) throw new Error('Failed to start dupe generation')
+  return res.json() as Promise<{ ok: boolean; alreadyRunning?: boolean }>
+}
+
+export async function pollDupeStatus(waitSec = 30): Promise<DupeFinderStatus> {
+  const res = await fetch(`${BASE}/dupes/status?wait=${waitSec}`, { headers: authHeaders() })
+  if (!res.ok) throw new Error('Failed to poll dupe status')
+  return res.json() as Promise<DupeFinderStatus>
+}
+
+export async function dismissDupePair(topicIdA: number, topicIdB: number): Promise<void> {
+  const res = await fetch(`${BASE}/dupes/dismiss`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ topicIdA, topicIdB }),
+  })
+  if (!res.ok) throw new Error((await res.json().catch(() => ({ error: 'dismiss failed' })) as { error: string }).error)
+}
+
 export interface Preferences {
   intervalMs: number
   preferenceProfile: string

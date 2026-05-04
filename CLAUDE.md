@@ -21,6 +21,7 @@ Each file is self-contained: spec + design decisions for that component. Read on
 | Consolidator (topic matching, summaries, ungroup/unmerge) | `src/consolidator/` | `@docs/consolidator.md` |
 | Aggregator (per-user front pages) | `src/aggregator/` | `@docs/aggregator.md` |
 | Profiler (preference profile generation) | `src/profiler/` | `@docs/profiler.md` |
+| Dupe finder (manual scan for duplicate-topic candidates) | `src/dupes/` | `@docs/dupes.md` |
 | UI + HTTP server (SvelteKit SPA, Fastify, SSE) | `ui/`, `src/server/` | `@docs/ui.md` |
 
 Cross-component flows worth knowing about up-front:
@@ -58,6 +59,7 @@ Node.js v22.5+ (uses `node:sqlite`), TypeScript strict + ES modules. Fastify bac
   "embedding": { "model", "batchSize", "candidateThreshold", "candidateMinK", "candidateMaxK" },
   "consolidator": { "statusWindowMs" },
   "aggregator": { "intervalMs", "workers" },
+  "dupes": { "maxCandidates" },
   "server": { "port", "uiDir" },
   "dbPath": "./newsagg.db"
 }

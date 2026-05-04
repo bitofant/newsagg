@@ -12,6 +12,7 @@ import { getAi } from '../ai/index.js'
 import type { Aggregator } from '../aggregator/index.js'
 import type { Consolidator } from '../consolidator/index.js'
 import type { Profiler } from '../profiler/index.js'
+import type { DupeFinder, DupeFinderStatus } from '../dupes/index.js'
 import type { ServerConfig } from '../config.js'
 
 const JWT_SECRET = loadJwtSecret()
@@ -38,11 +39,12 @@ export interface ServerOptions {
   aggregator: Aggregator
   consolidator: Consolidator
   profiler: Profiler
+  dupeFinder: DupeFinder
   config: ServerConfig
 }
 
 // IMPLEMENTED: auth routes, front page API, voting endpoint, user preferences, SSE push for new front pages
-export async function createServer({ db, aggregator, consolidator, profiler, config }: ServerOptions) {
+export async function createServer({ db, aggregator, consolidator, profiler, dupeFinder, config }: ServerOptions) {
   const app = Fastify({ logger: true })
 
   // SSE connections: userId -> set of active response streams
@@ -434,6 +436,75 @@ export async function createServer({ db, aggregator, consolidator, profiler, con
       set.add(notify)
       unmergeWaiters.set(topicId, set)
     })
+  })
+
+  // --- Duplicate-topic finder ---
+
+  app.post('/api/dupes/generate', async (req, reply) => {
+    const callerId = authenticate(req)
+    if (!callerId) return reply.status(401).send({ error: 'unauthorized' })
+
+    const status = dupeFinder.status()
+    if (status.state === 'running') return { ok: true, alreadyRunning: true }
+
+    // Fire-and-forget: result lands in dupeFinder.status() and triggers onCompletion listeners.
+    void dupeFinder.generate().catch((err) => {
+      app.log.error(err, 'dupe generation failed')
+    })
+    return { ok: true }
+  })
+
+  app.get('/api/dupes/status', async (req, reply) => {
+    const callerId = authenticate(req)
+    if (!callerId) return reply.status(401).send({ error: 'unauthorized' })
+
+    const status = dupeFinder.status()
+    if (status.state !== 'running') return status
+
+    const waitParam = (req.query as Record<string, string>).wait
+    const waitSec = waitParam ? Math.max(0, Math.min(parseInt(waitParam, 10) || 0, 60)) : 0
+    if (waitSec === 0) return status
+
+    return await new Promise<DupeFinderStatus>((resolve) => {
+      let settled = false
+      const settle = (v: DupeFinderStatus) => {
+        if (settled) return
+        settled = true
+        unsubscribe()
+        clearTimeout(timer)
+        resolve(v)
+      }
+      const unsubscribe = dupeFinder.onCompletion(() => settle(dupeFinder.status()))
+      const timer = setTimeout(() => settle(dupeFinder.status()), waitSec * 1000)
+    })
+  })
+
+  app.get('/api/dupes', async (req, reply) => {
+    const callerId = authenticate(req)
+    if (!callerId) return reply.status(401).send({ error: 'unauthorized' })
+
+    const status = dupeFinder.status()
+    return { candidates: db.news.listDupeCandidates(), status }
+  })
+
+  app.post('/api/dupes/dismiss', async (req, reply) => {
+    const callerId = authenticate(req)
+    if (!callerId) return reply.status(401).send({ error: 'unauthorized' })
+
+    const { topicIdA, topicIdB } = req.body as { topicIdA?: number; topicIdB?: number }
+    if (typeof topicIdA !== 'number' || typeof topicIdB !== 'number' || isNaN(topicIdA) || isNaN(topicIdB)) {
+      return reply.status(400).send({ error: 'topicIdA and topicIdB (numbers) required' })
+    }
+    if (topicIdA === topicIdB) {
+      return reply.status(400).send({ error: 'cannot dismiss a topic against itself' })
+    }
+    const lo = Math.min(topicIdA, topicIdB)
+    const hi = Math.max(topicIdA, topicIdB)
+    if (!db.news.getTopic(lo) || !db.news.getTopic(hi)) {
+      return reply.status(404).send({ error: 'topic not found' })
+    }
+    db.news.dismissDupeCandidate(lo, hi)
+    return { ok: true }
   })
 
   // --- SSE: real-time front page push ---

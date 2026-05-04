@@ -5,7 +5,7 @@
   import { goto, onNavigate } from '$app/navigation'
   import { toggleTheme, getTheme } from '$lib/theme'
   import { morphingTopicId } from '$lib/transition'
-  import { Menu, X, Sun, Moon, Settings, Activity, LogOut } from 'lucide-svelte'
+  import { Menu, X, Sun, Moon, Settings, Activity, LogOut, Copy } from 'lucide-svelte'
   import { slide } from 'svelte/transition'
 
   onNavigate(async (navigation) => {
@@ -91,6 +91,10 @@
             <a href="/settings" onclick={() => menuOpen = false} class="w-full flex items-center gap-3 px-2 py-3 text-stone-600 dark:text-stone-300 hover:text-stone-900 dark:hover:text-stone-100">
               <Settings size={18} />
               <span>Settings</span>
+            </a>
+            <a href="/dupes" onclick={() => menuOpen = false} class="w-full flex items-center gap-3 px-2 py-3 text-stone-600 dark:text-stone-300 hover:text-stone-900 dark:hover:text-stone-100">
+              <Copy size={18} />
+              <span>Find duplicates</span>
             </a>
           {/if}
           <a href="/status" onclick={() => menuOpen = false} class="w-full flex items-center gap-3 px-2 py-3 text-stone-600 dark:text-stone-300 hover:text-stone-900 dark:hover:text-stone-100">

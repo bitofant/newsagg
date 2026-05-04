@@ -111,6 +111,25 @@ export interface NewsDb {
   /** Topics whose stored embedding is missing or was produced by a different model. Used by backfill. */
   listTopicsMissingEmbedding(model: string, limit: number, offset: number): Topic[]
   topicsMissingEmbeddingCount(model: string): number
+  // --- Duplicate-topic candidates / dismissals ---
+  // All dupe-pair callers must pass topicIdA < topicIdB; the methods assert this.
+  /** Replace the entire candidates table with the given pairs. Atomic via transaction; rows whose topics no longer exist are silently skipped. */
+  replaceDupeCandidates(pairs: Array<{ topicIdA: number; topicIdB: number; similarity: number }>): void
+  /** All current candidate pairs joined with topic titles + article counts, ordered by similarity desc. */
+  listDupeCandidates(): Array<{
+    topicIdA: number
+    topicIdB: number
+    similarity: number
+    createdAt: number
+    titleA: string
+    titleB: string
+    articleCountA: number
+    articleCountB: number
+  }>
+  /** Permanently mark a pair as not-a-duplicate. Atomically removes any matching candidate row. */
+  dismissDupeCandidate(topicIdA: number, topicIdB: number): void
+  /** All previously-dismissed pairs. Used by the finder to exclude them from new candidate runs. */
+  listDupeDismissalPairs(): Array<{ topicIdA: number; topicIdB: number }>
 }
 
 function float32ArrayToBlob(arr: Float32Array): Buffer {
@@ -387,7 +406,93 @@ export function createNewsDb(db: DatabaseSync): NewsDb {
       db.prepare('DELETE FROM signal_queue WHERE topic_id = ?').run(id)
       db.prepare('DELETE FROM user_read_topics WHERE topic_id = ?').run(id)
       db.prepare('DELETE FROM article_topics WHERE topic_id = ?').run(id)
+      db.prepare('DELETE FROM topic_dupe_candidates WHERE topic_id_a = ? OR topic_id_b = ?').run(id, id)
+      db.prepare('DELETE FROM topic_dupe_dismissals WHERE topic_id_a = ? OR topic_id_b = ?').run(id, id)
       db.prepare('DELETE FROM topics WHERE id = ?').run(id)
+    },
+
+    replaceDupeCandidates(pairs) {
+      const insert = db.prepare(
+        `INSERT OR IGNORE INTO topic_dupe_candidates (topic_id_a, topic_id_b, similarity, created_at)
+         SELECT ?, ?, ?, ?
+         WHERE EXISTS (SELECT 1 FROM topics WHERE id = ?) AND EXISTS (SELECT 1 FROM topics WHERE id = ?)`,
+      )
+      const now = Date.now()
+      db.exec('BEGIN')
+      try {
+        db.exec('DELETE FROM topic_dupe_candidates')
+        for (const p of pairs) {
+          if (p.topicIdA >= p.topicIdB) {
+            throw new Error(`replaceDupeCandidates requires topicIdA < topicIdB (got ${p.topicIdA}, ${p.topicIdB})`)
+          }
+          insert.run(p.topicIdA, p.topicIdB, p.similarity, now, p.topicIdA, p.topicIdB)
+        }
+        db.exec('COMMIT')
+      } catch (e) {
+        db.exec('ROLLBACK')
+        throw e
+      }
+    },
+
+    listDupeCandidates() {
+      const rows = db
+        .prepare(
+          `SELECT
+             c.topic_id_a, c.topic_id_b, c.similarity, c.created_at,
+             ta.title AS title_a, tb.title AS title_b,
+             (SELECT COUNT(*) FROM article_topics WHERE topic_id = c.topic_id_a) AS article_count_a,
+             (SELECT COUNT(*) FROM article_topics WHERE topic_id = c.topic_id_b) AS article_count_b
+           FROM topic_dupe_candidates c
+           JOIN topics ta ON ta.id = c.topic_id_a
+           JOIN topics tb ON tb.id = c.topic_id_b
+           ORDER BY c.similarity DESC, c.topic_id_a ASC, c.topic_id_b ASC`,
+        )
+        .all() as Array<{
+          topic_id_a: number
+          topic_id_b: number
+          similarity: number
+          created_at: number
+          title_a: string
+          title_b: string
+          article_count_a: number
+          article_count_b: number
+        }>
+      return rows.map((r) => ({
+        topicIdA: r.topic_id_a,
+        topicIdB: r.topic_id_b,
+        similarity: r.similarity,
+        createdAt: r.created_at,
+        titleA: r.title_a,
+        titleB: r.title_b,
+        articleCountA: r.article_count_a,
+        articleCountB: r.article_count_b,
+      }))
+    },
+
+    dismissDupeCandidate(topicIdA, topicIdB) {
+      if (topicIdA >= topicIdB) {
+        throw new Error(`dismissDupeCandidate requires topicIdA < topicIdB (got ${topicIdA}, ${topicIdB})`)
+      }
+      db.exec('BEGIN')
+      try {
+        db.prepare(
+          `INSERT OR IGNORE INTO topic_dupe_dismissals (topic_id_a, topic_id_b, dismissed_at)
+           SELECT ?, ?, ?
+           WHERE EXISTS (SELECT 1 FROM topics WHERE id = ?) AND EXISTS (SELECT 1 FROM topics WHERE id = ?)`,
+        ).run(topicIdA, topicIdB, Date.now(), topicIdA, topicIdB)
+        db.prepare('DELETE FROM topic_dupe_candidates WHERE topic_id_a = ? AND topic_id_b = ?').run(topicIdA, topicIdB)
+        db.exec('COMMIT')
+      } catch (e) {
+        db.exec('ROLLBACK')
+        throw e
+      }
+    },
+
+    listDupeDismissalPairs() {
+      const rows = db
+        .prepare('SELECT topic_id_a, topic_id_b FROM topic_dupe_dismissals')
+        .all() as Array<{ topic_id_a: number; topic_id_b: number }>
+      return rows.map((r) => ({ topicIdA: r.topic_id_a, topicIdB: r.topic_id_b }))
     },
   }
 }
