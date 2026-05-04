@@ -3,6 +3,7 @@ import { createGrabber } from './grabber/index.js'
 import { createConsolidator } from './consolidator/index.js'
 import { createAggregator } from './aggregator/index.js'
 import { createProfiler } from './profiler/index.js'
+import { createDupeFinder } from './dupes/index.js'
 import { createServer } from './server/index.js'
 import { config } from './config.js'
 
@@ -25,7 +26,9 @@ async function main() {
 
   const profiler = createProfiler({ db })
 
-  const server = await createServer({ db, aggregator, consolidator, profiler, config: config.server })
+  const dupeFinder = createDupeFinder({ db, embedding: config.embedding, dupes: config.dupes })
+
+  const server = await createServer({ db, aggregator, consolidator, profiler, dupeFinder, config: config.server })
   notifyFrontPage = server.notifyFrontPageGenerated.bind(server)
 
   await server.listen()

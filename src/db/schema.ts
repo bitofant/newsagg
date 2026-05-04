@@ -131,4 +131,29 @@ export function applySchema(db: DatabaseSync): void {
     );
     CREATE INDEX IF NOT EXISTS idx_user_read_topics_user ON user_read_topics(user_id);
   `)
+
+  // Duplicate-topic candidates (regenerated on demand) and permanent dismissals.
+  // Pair is canonicalized so topic_id_a < topic_id_b — prevents (A,B) and (B,A) both existing.
+  // FK to topics(id) plus a manual cascade in deleteTopic() keep these in sync with the topic
+  // lifecycle (merges/unmerges all funnel through deleteTopic).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS topic_dupe_candidates (
+      topic_id_a INTEGER NOT NULL REFERENCES topics(id),
+      topic_id_b INTEGER NOT NULL REFERENCES topics(id),
+      similarity REAL    NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (topic_id_a, topic_id_b),
+      CHECK (topic_id_a < topic_id_b)
+    );
+    CREATE INDEX IF NOT EXISTS idx_topic_dupe_candidates_sim
+      ON topic_dupe_candidates(similarity DESC);
+
+    CREATE TABLE IF NOT EXISTS topic_dupe_dismissals (
+      topic_id_a   INTEGER NOT NULL REFERENCES topics(id),
+      topic_id_b   INTEGER NOT NULL REFERENCES topics(id),
+      dismissed_at INTEGER NOT NULL,
+      PRIMARY KEY (topic_id_a, topic_id_b),
+      CHECK (topic_id_a < topic_id_b)
+    );
+  `)
 }

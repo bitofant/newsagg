@@ -9,7 +9,13 @@ export interface Config {
   rssPollInterval: RssPollIntervalConfig
   consolidator: ConsolidatorConfig
   aggregator: AggregatorConfig
+  dupes: DupesConfig
   server: ServerConfig
+}
+
+export interface DupesConfig {
+  /** Number of top-similarity topic pairs to surface per generation run. The N most-similar pairs are shown regardless of absolute cosine. */
+  maxCandidates: number
 }
 
 export interface RssPollIntervalConfig {
@@ -131,6 +137,9 @@ function loadConfig(): Config {
     aggregator: {
       intervalMs: raw.aggregator?.intervalMs ?? 15 * 60 * 1000,
       workers: raw.aggregator?.workers ?? 2,
+    },
+    dupes: {
+      maxCandidates: raw.dupes?.maxCandidates ?? 10,
     },
     server: {
       port: raw.server?.port ?? 3000,
