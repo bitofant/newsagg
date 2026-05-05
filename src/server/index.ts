@@ -304,6 +304,47 @@ export async function createServer({ db, aggregator, consolidator, profiler, dup
     }
   })
 
+  // Stream a manual summary regeneration at reasoningEffort:'high' as SSE events.
+  // Frames: `event: reasoning\ndata: {delta}`, `event: content\ndata: {delta}`,
+  //         `event: done\ndata: {result}`, `event: error\ndata: {error}`.
+  app.post('/api/topics/:topicId/regenerate-summary', async (req, reply) => {
+    const userId = authenticate(req)
+    if (!userId) return reply.status(401).send({ error: 'unauthorized' })
+
+    const topicId = parseInt((req.params as { topicId: string }).topicId, 10)
+    if (isNaN(topicId)) return reply.status(400).send({ error: 'invalid topicId' })
+    if (!db.news.getTopic(topicId)) return reply.status(404).send({ error: 'topic not found' })
+
+    const res = reply.raw
+    res.setHeader('Content-Type', 'text/event-stream')
+    res.setHeader('Cache-Control', 'no-cache')
+    res.setHeader('Connection', 'keep-alive')
+    res.setHeader('X-Accel-Buffering', 'no')
+    res.flushHeaders()
+    await reply.hijack()
+
+    let clientGone = false
+    res.on('close', () => { clientGone = true })
+
+    const send = (event: string, data: unknown) => {
+      if (clientGone) return
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+    }
+
+    try {
+      const result = await consolidator.regenerateTopicSummaryWithReasoning(topicId, {
+        onReasoning: (delta) => send('reasoning', { delta }),
+        onContent: (delta) => send('content', { delta }),
+      })
+      send('done', result)
+    } catch (err) {
+      req.log.error(err, 'regenerate-summary failed')
+      send('error', { error: err instanceof Error ? err.message : 'regenerate failed' })
+    } finally {
+      if (!clientGone) res.end()
+    }
+  })
+
   app.post('/api/topics/:topicId/articles/:articleId/ungroup', async (req, reply) => {
     const userId = authenticate(req)
     if (!userId) return reply.status(401).send({ error: 'unauthorized' })

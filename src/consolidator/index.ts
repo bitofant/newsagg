@@ -1,5 +1,5 @@
 import { getAi, type InferenceProvider } from '../ai/index.js'
-import { MAX_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS_REASONING } from '../ai/provider.js'
+import { MAX_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS_REASONING, type StreamCallbacks } from '../ai/provider.js'
 import type { ConsolidatorConfig, EmbeddingConfig } from '../config.js'
 import type { Db } from '../db/index.js'
 import type { RawArticle } from '../grabber/index.js'
@@ -72,6 +72,10 @@ function stripCodeFences(text: string): string {
   return match ? match[1].trim() : trimmed
 }
 
+export type RegenSummaryResult =
+  | { mode: 'short'; summary: string }
+  | { mode: 'long'; summary: string; bullets: string[]; newInfo: string[] }
+
 export interface Consolidator {
   /** Push an article into the internal queue (sync, non-blocking) */
   enqueue(article: RawArticle): void
@@ -81,6 +85,15 @@ export interface Consolidator {
   unmergeTopic(topicId: number): Promise<{ newTopicIds: number[]; affectedUserIds: number[] }>
   /** Merge `loserId` into `winnerId`: rewire articles, rewrite affected front pages, enqueue summary regen, delete loser. */
   mergeTopic(loserId: number, winnerId: number): Promise<{ winnerId: number; affectedUserIds: number[] }>
+  /**
+   * Manual on-demand regen of a topic's summary at `reasoningEffort: 'high'`. Streams reasoning and
+   * content deltas via callbacks, persists the result, and re-embeds the topic. Picks short or long
+   * mode using the same `BULLETS_THRESHOLD` rule as the auto path.
+   */
+  regenerateTopicSummaryWithReasoning(
+    topicId: number,
+    callbacks: StreamCallbacks,
+  ): Promise<RegenSummaryResult>
   /** Queue a topic for background summary regeneration on the next drain. Deduped via a Set. */
   enqueueRegen(topicId: number): void
   status(): {
@@ -659,12 +672,24 @@ export function createConsolidator({
     return { winnerId, affectedUserIds }
   }
 
+  async function regenerateTopicSummaryWithReasoning(
+    topicId: number,
+    callbacks: StreamCallbacks,
+  ): Promise<RegenSummaryResult> {
+    const ai = getAi()
+    await ai.ensureInitialized()
+    const result = await regenerateSingleTopicWithReasoning(ai, db, topicId, callbacks)
+    await embedAndStoreTopicsByIds(getEmbedder(), [topicId])
+    return result
+  }
+
   return {
     enqueue,
     enqueueRegen,
     ungroupArticle,
     unmergeTopic,
     mergeTopic,
+    regenerateTopicSummaryWithReasoning,
     status() {
       let estimatedBehindMs: number | null = null
 
@@ -1283,6 +1308,133 @@ async function regenerateLongMode(ai: InferenceProvider, db: Db, contexts: Topic
       console.error('[consolidator] failed to parse long-mode batch chunk, skipping')
     }
   }))
+}
+
+const SHORT_MODE_MANUAL_SYSTEM = `You are a news editor. The user has manually requested a regenerated summary at high reasoning effort.
+
+The user's message may contain two article sections:
+- "Earlier articles": established context, already covered.
+- "Recent articles (since ...)": fetched after the latest substantial-news detection — the source of truth for what's new.
+
+Reply format:
+- 2-3 sentences capturing the topic situation, drawing on all articles.
+- If a "Recent articles" section is present AND it introduces material developments not in the Earlier section, append a final paragraph (separated by a blank line) starting "NEW: " that summarizes those developments specifically (1-2 sentences).
+- If there is no "Earlier articles" section (the topic has had no prior substantial-news event), omit the "NEW:" paragraph — just write the regular summary.
+
+Some articles may cover multiple topics — focus ONLY on aspects relevant to this specific topic.
+Prefer concrete facts (who/what/when) over mood or analysis. Skip emotional content unless paired with a real event.
+
+Reply with ONLY the summary text, no JSON, no formatting.`
+
+const LONG_MODE_MANUAL_SYSTEM = `You are a news editor maintaining a running brief for an ongoing situation. The user has manually requested a regenerated brief at high reasoning effort.
+
+The user's message contains two article sections:
+- "Earlier articles": established context, already covered.
+- "Recent articles (since ...)": fetched after the latest substantial-news detection — the source of truth for what's "new".
+
+Produce an updated brief with three fields:
+- "summary": when "newInfo" will be empty, 2-3 sentences capturing the stable overall situation. When "newInfo" will be non-empty, MUST be exactly two paragraphs separated by a single blank line (\\n\\n in the JSON string): the first paragraph (2-3 sentences) covers the stable overall situation; the second paragraph MUST start with the literal prefix "New: " and summarize the recent developments in 1-2 sentences. Do NOT restate individual events in the first paragraph.
+- "bullets": array of bullets (max 8) covering material developments to date, oldest-relevant first.
+- "newInfo": array (1-3) of bullets describing what the "Recent articles" section introduces. Identify these from the recent articles directly — DO NOT defer to the previous "Current NEW info" list (it may be stale or empty after a prior regeneration). Re-flag genuinely new developments even if they were flagged before. Only return an empty array if the Recent articles truly add nothing material.
+
+${LONG_MODE_STYLE_RULES}
+
+Reply with ONLY JSON: { "summary": "...", "bullets": ["..."], "newInfo": ["..."] }`
+
+function renderArticleLines(articles: Article[]): string {
+  return articles.map((a) => `- "${a.title}" (${a.source}): ${a.text.slice(0, 200)}`).join('\n')
+}
+
+/**
+ * Splits the given articles into "earlier" (fetched before the most recent substantial-news event)
+ * and "recent" (at/after that timestamp). When the topic has had no substantial-news event yet,
+ * `lastEventTs` is null and all articles are treated as the general context (no Earlier section).
+ */
+function splitArticlesByLastEvent(
+  articles: Article[],
+  substantialEventTimestamps: number[],
+): { earlier: Article[]; recent: Article[]; lastEventTs: number | null } {
+  if (substantialEventTimestamps.length === 0) {
+    return { earlier: [], recent: articles, lastEventTs: null }
+  }
+  const lastEventTs = Math.max(...substantialEventTimestamps)
+  const earlier: Article[] = []
+  const recent: Article[] = []
+  for (const a of articles) {
+    if (a.fetchedAt >= lastEventTs) recent.push(a)
+    else earlier.push(a)
+  }
+  // Defensive: if every article happens to predate the last event timestamp (clock skew, manual
+  // backfill, etc.), treat the most recent ones as "recent" so the prompt still has something.
+  if (recent.length === 0 && earlier.length > 0) {
+    return { earlier: [], recent: articles, lastEventTs }
+  }
+  return { earlier, recent, lastEventTs }
+}
+
+function renderManualRegenArticles(earlier: Article[], recent: Article[], lastEventTs: number | null): string {
+  if (lastEventTs === null || earlier.length === 0) {
+    return `Recent articles:\n${renderArticleLines(recent)}`
+  }
+  const dateStr = new Date(lastEventTs).toISOString().slice(0, 16).replace('T', ' ') + ' UTC'
+  return `Earlier articles:\n${renderArticleLines(earlier)}\n\nRecent articles (since ${dateStr}):\n${renderArticleLines(recent)}`
+}
+
+/**
+ * Single-topic streaming regen at `reasoningEffort: 'high'`. Diverges from the auto regen path:
+ * articles are split by the last `substantialEventTimestamps` entry into Earlier / Recent sections,
+ * and the "newInfo" axis is re-derived from the Recent section instead of being framed as "since
+ * the previous regeneration" (which causes prior newInfo to drop on every rerun).
+ */
+async function regenerateSingleTopicWithReasoning(
+  ai: InferenceProvider,
+  db: Db,
+  topicId: number,
+  callbacks: StreamCallbacks,
+): Promise<RegenSummaryResult> {
+  const articles = db.news.listRecentArticlesByTopic(topicId, 10)
+  if (articles.length < 2) throw new Error('topic must have at least 2 articles to regenerate')
+  const topic = db.news.getTopic(topicId)
+  if (!topic) throw new Error('topic not found')
+
+  const { earlier, recent, lastEventTs } = splitArticlesByLastEvent(articles, topic.substantialEventTimestamps)
+  const articleSections = renderManualRegenArticles(earlier, recent, lastEventTs)
+  const isLong = topic.substantialEventTimestamps.length >= BULLETS_THRESHOLD
+
+  if (isLong) {
+    const bulletsList = topic.bullets && topic.bullets.length > 0
+      ? topic.bullets.map((b) => `- ${b}`).join('\n')
+      : '(none yet)'
+    const userPrompt =
+      `Topic: ${topic.title}\n` +
+      `Background: ${topic.description}\n\n` +
+      `Current summary: ${topic.summary ?? '(none yet)'}\n` +
+      `Current bullets:\n${bulletsList}\n\n` +
+      articleSections
+    const response = await ai.completeStream(
+      userPrompt,
+      { systemPrompt: LONG_MODE_MANUAL_SYSTEM, reasoningEffort: 'high' },
+      callbacks,
+    )
+    const parsed = parseLongModeResult(JSON.parse(stripCodeFences(response)))
+    if (!parsed) throw new Error('long-mode regen produced empty/invalid result')
+    db.news.updateTopicLongForm(topicId, parsed)
+    return { mode: 'long', ...parsed }
+  } else {
+    const userPrompt =
+      `Topic: ${topic.title}\n` +
+      `Background: ${topic.description}\n\n` +
+      articleSections
+    const response = await ai.completeStream(
+      userPrompt,
+      { systemPrompt: SHORT_MODE_MANUAL_SYSTEM, reasoningEffort: 'high' },
+      callbacks,
+    )
+    const summary = response.trim()
+    if (!summary) throw new Error('short-mode regen produced empty result')
+    db.news.updateTopicSummary(topicId, summary)
+    return { mode: 'short', summary }
+  }
 }
 
 interface ArticleAssessment {

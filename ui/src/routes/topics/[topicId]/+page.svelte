@@ -2,11 +2,11 @@
   import { onMount } from 'svelte'
   import { goto } from '$app/navigation'
   import { page } from '$app/state'
-  import { isLoggedIn, getTopicDetail, vote, setTopicRead, ungroupArticle, startUnmerge, pollUnmergeResult, listTopics, mergeTopic } from '$lib/api'
+  import { isLoggedIn, getTopicDetail, vote, setTopicRead, ungroupArticle, startUnmerge, pollUnmergeResult, listTopics, mergeTopic, regenerateTopicSummary } from '$lib/api'
   import type { TopicDetail, TopicListEntry } from '$lib/api'
   import { timeAgo } from '$lib/time'
   import { morphSnapshot } from '$lib/transition'
-  import { ArrowLeft, ThumbsUp, ThumbsDown, CircleCheck, Circle, Unlink2, Split, Merge, Loader2, Search, X } from 'lucide-svelte'
+  import { ArrowLeft, ThumbsUp, ThumbsDown, CircleCheck, Circle, Unlink2, Split, Merge, Loader2, Search, X, Sparkles } from 'lucide-svelte'
   import { fade } from 'svelte/transition'
 
   type UnmergePhase = 'confirm' | 'pending' | 'done' | 'error'
@@ -28,6 +28,16 @@
     error?: string
   }
 
+  type RegenPhase = 'thinking' | 'writing'
+  interface RegenState {
+    phase: RegenPhase
+    mode: 'short' | 'long'
+    reasoning: string
+    contentSoFar: string
+    /** Snapshot of the summary before streaming, so short-mode can restore on error. */
+    originalSummary: string | null
+  }
+
   let topic = $state<TopicDetail | null>(null)
   let loading = $state(true)
   let error = $state('')
@@ -35,6 +45,8 @@
   let ungroupingArticles = $state(new Set<number>())
   let unmergeOverlay = $state<UnmergeOverlay | null>(null)
   let mergeOverlay = $state<MergeOverlay | null>(null)
+  let regen = $state<RegenState | null>(null)
+  let regenError = $state('')
 
   $effect(() => {
     const id = page.params['topicId']
@@ -199,6 +211,70 @@
     }
   }
 
+  async function handleRegenerate() {
+    if (!topic || regen) return
+    if (topic.articles.length < 2) return
+    regenError = ''
+    const isLong = (topic.bullets?.length ?? 0) + (topic.newInfo?.length ?? 0) > 0
+    const mode: 'short' | 'long' = isLong ? 'long' : 'short'
+    const originalSummary = topic.summary
+    const topicId = topic.id
+
+    regen = {
+      phase: 'thinking',
+      mode,
+      reasoning: '',
+      contentSoFar: '',
+      originalSummary,
+    }
+
+    // Short-mode: clear summary so the live content can replace it as it streams in.
+    if (mode === 'short' && topic) {
+      topic = { ...topic, summary: '' }
+    }
+
+    try {
+      const result = await regenerateTopicSummary(topicId, {
+        onReasoning: (delta) => {
+          if (!regen) return
+          regen = { ...regen, reasoning: regen.reasoning + delta }
+        },
+        onContent: (delta) => {
+          if (!regen) return
+          const next = regen.contentSoFar + delta
+          regen = { ...regen, phase: 'writing', contentSoFar: next }
+          if (regen.mode === 'short' && topic) {
+            topic = { ...topic, summary: next }
+          }
+        },
+      })
+      if (!topic) return
+      if (result.mode === 'short') {
+        topic = { ...topic, summary: result.summary }
+      } else {
+        topic = { ...topic, summary: result.summary, bullets: result.bullets, newInfo: result.newInfo }
+      }
+      regen = null
+    } catch (e) {
+      regenError = e instanceof Error ? e.message : String(e)
+      // Restore summary on short-mode failure (long-mode kept its original visible).
+      if (regen?.mode === 'short' && topic) {
+        topic = { ...topic, summary: originalSummary }
+      }
+      regen = null
+    }
+  }
+
+  function formatReasoningSize(text: string): string {
+    const chars = text.length
+    if (chars < 500) return `${chars.toLocaleString()} chars`
+    const words = text.trim().split(/\s+/).filter(Boolean).length
+    if (words < 600) return `${words.toLocaleString()} words`
+    const pages = words / 500
+    if (pages < 10) return `${pages.toFixed(1)} pages`
+    return `${Math.round(pages).toLocaleString()} pages`
+  }
+
   function topicVote(): 1 | -1 | undefined {
     if (!topic) return undefined
     return topic.articles.map((a) => votes.get(a.id)).find((v) => v !== undefined)
@@ -236,12 +312,16 @@
       {/if}
 
       {#if heroSummary}
-        <p
-          class="mt-5 text-lg leading-relaxed text-stone-700 dark:text-stone-300"
+        <div
+          class="mt-5 text-lg leading-relaxed text-stone-700 dark:text-stone-300 space-y-3"
           style="view-transition-name: topic-summary"
         >
-          {heroSummary}
-        </p>
+          {#each heroSummary.split(/\n\s*\n/) as para}
+            <p>
+              {#if para.startsWith('New: ')}<strong class="text-amber-600 dark:text-amber-400">New:</strong> {para.slice(5)}{:else}{para}{/if}
+            </p>
+          {/each}
+        </div>
       {/if}
 
       {#if topic && ((topic.bullets?.length ?? 0) + (topic.newInfo?.length ?? 0) > 0)}
@@ -309,7 +389,40 @@
           <Merge size={20} />
           <span>Merge into…</span>
         </button>
+        <button
+          onclick={handleRegenerate}
+          disabled={!!regen || !!unmergeOverlay || !!mergeOverlay || topic.articles.length < 2}
+          class="flex items-center gap-2 px-3 py-2 rounded-full text-sm transition-colors text-stone-600 dark:text-stone-400 hover:bg-stone-100 dark:hover:bg-stone-800 disabled:opacity-40 disabled:cursor-not-allowed"
+          title="Regenerate the summary with reasoning enabled"
+        >
+          {#if regen}<Loader2 size={20} class="animate-spin" />{:else}<Sparkles size={20} />{/if}
+          <span>{regen ? (regen.phase === 'thinking' ? 'Thinking…' : 'Writing…') : 'Regenerate'}</span>
+          {#if regen?.mode === 'long' && regen.phase === 'writing'}
+            <span class="ml-1 text-xs px-1.5 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300">long-mode</span>
+          {/if}
+        </button>
       </div>
+
+      {#if regen}
+        <details class="mt-4 rounded-lg bg-stone-100 dark:bg-stone-900/60 px-4 py-3" transition:fade={{ duration: 150 }}>
+          <summary class="cursor-pointer text-sm font-medium text-stone-600 dark:text-stone-400 select-none">
+            Reasoning <span class="text-xs font-normal text-stone-400 dark:text-stone-500 tabular-nums">· {formatReasoningSize(regen.reasoning)}</span>
+          </summary>
+          <pre class="mt-2 whitespace-pre-wrap text-xs leading-relaxed text-stone-500 dark:text-stone-400 max-h-64 overflow-y-auto font-mono">{regen.reasoning || '…'}</pre>
+        </details>
+      {/if}
+
+      {#if regenError}
+        <div
+          class="mt-4 rounded-lg bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900 px-4 py-3 flex items-start justify-between gap-3"
+          transition:fade={{ duration: 150 }}
+        >
+          <p class="text-sm text-red-700 dark:text-red-300">Regeneration failed: {regenError}</p>
+          <button onclick={() => (regenError = '')} class="text-red-500 hover:text-red-700 dark:hover:text-red-200 shrink-0" aria-label="Dismiss">
+            <X size={18} />
+          </button>
+        </div>
+      {/if}
 
       <section class="mt-8">
         <h2 class="font-serif text-xl font-semibold mb-2">

@@ -52,6 +52,14 @@ interface ChatMessage {
   content: string
 }
 
+interface ChatCompletionUsage {
+  prompt_tokens?: number
+  completion_tokens?: number
+  completion_tokens_details?: { reasoning_tokens?: number }
+  // vLLM (with --enable-prefix-caching) reports cached prompt tokens here, mirroring the OpenAI shape.
+  prompt_tokens_details?: { cached_tokens?: number }
+}
+
 interface ChatCompletionResponse {
   choices: {
     message: {
@@ -62,13 +70,23 @@ interface ChatCompletionResponse {
       reasoning?: string
     }
   }[]
-  usage?: {
-    prompt_tokens?: number
-    completion_tokens?: number
-    completion_tokens_details?: { reasoning_tokens?: number }
-    // vLLM (with --enable-prefix-caching) reports cached prompt tokens here, mirroring the OpenAI shape.
-    prompt_tokens_details?: { cached_tokens?: number }
-  }
+  usage?: ChatCompletionUsage
+}
+
+interface ChatCompletionStreamChunk {
+  choices?: {
+    delta?: {
+      content?: string
+      reasoning_content?: string
+      reasoning?: string
+    }
+  }[]
+  usage?: ChatCompletionUsage
+}
+
+export interface StreamCallbacks {
+  onReasoning?: (delta: string) => void
+  onContent?: (delta: string) => void
 }
 
 interface CallRecord {
@@ -245,6 +263,82 @@ export abstract class InferenceProvider {
     }
   }
 
+  /**
+   * Streaming counterpart of `complete()`. Same lifecycle (init → gate → fetch → release), same
+   * metrics, same llm/ logs (written at the end). Dispatches incremental reasoning/content deltas
+   * via callbacks; returns the full accumulated content string.
+   */
+  async completeStream(prompt: string, opts: CompleteOptions | undefined, callbacks: StreamCallbacks): Promise<string> {
+    await this.ensureInitialized()
+
+    const messages: ChatMessage[] = []
+    if (opts?.systemPrompt) messages.push({ role: 'system', content: opts.systemPrompt })
+    messages.push({ role: 'user', content: prompt })
+
+    const body: Record<string, unknown> = {
+      model: this.resolvedModel,
+      messages,
+      max_tokens: maxOutputFor(opts),
+      stream: true,
+      stream_options: { include_usage: true },
+    }
+    if (opts?.reasoningEffort === 'off') {
+      body['chat_template_kwargs'] = { enable_thinking: false }
+    } else if (opts?.reasoningEffort) {
+      body['reasoning_effort'] = opts.reasoningEffort
+    }
+
+    const release = await this.gate.acquire(opts?.priority ?? 'normal')
+    try {
+      const timestamp = Math.floor(Date.now() / 1000)
+      const seq = logCallSeq++
+      const startedAt = Date.now()
+      const timeoutMs = opts?.timeoutMs ?? this.config.requestTimeoutMs
+
+      let content = ''
+      let reasoning = ''
+      let usage: ChatCompletionUsage | undefined
+      await this.streamChatCompletion(body, timeoutMs, (chunk) => {
+        const delta = chunk.choices?.[0]?.delta
+        if (delta) {
+          if (delta.content) {
+            content += delta.content
+            callbacks.onContent?.(delta.content)
+          }
+          const reasoningDelta = delta.reasoning_content ?? delta.reasoning
+          if (reasoningDelta) {
+            reasoning += reasoningDelta
+            callbacks.onReasoning?.(reasoningDelta)
+          }
+        }
+        if (chunk.usage) usage = chunk.usage
+      })
+      const endedAt = Date.now()
+
+      const reportedReasoningTokens = usage?.completion_tokens_details?.reasoning_tokens ?? 0
+      const reasoningTokens = reportedReasoningTokens > 0
+        ? reportedReasoningTokens
+        : reasoning
+          ? Math.ceil(reasoning.length / 4)
+          : 0
+
+      this.callHistory.push({
+        startedAt,
+        endedAt,
+        promptTokens: usage?.prompt_tokens ?? 0,
+        completionTokens: usage?.completion_tokens ?? 0,
+        reasoningTokens,
+        cachedTokens: usage?.prompt_tokens_details?.cached_tokens ?? 0,
+      })
+      this.pruneHistory(endedAt)
+
+      logLlmCall(timestamp, seq, { model: this.resolvedModel, messages }, content, reasoning || undefined)
+      return content
+    } finally {
+      release()
+    }
+  }
+
   status(): ProviderStatus {
     const now = Date.now()
     this.pruneHistory(now)
@@ -293,6 +387,50 @@ export abstract class InferenceProvider {
       throw new Error(`AI request failed: ${response.status} ${await response.text()}`)
     }
     return (await response.json()) as ChatCompletionResponse
+  }
+
+  /** Streaming POST to /chat/completions. Parses `data: {...}\n\n` SSE frames and dispatches each chunk. */
+  protected async streamChatCompletion(
+    body: Record<string, unknown>,
+    timeoutMs: number,
+    onChunk: (chunk: ChatCompletionStreamChunk) => void,
+  ): Promise<void> {
+    const response = await fetchWithTimeout(
+      `${this.config.url}/chat/completions`,
+      { method: 'POST', headers: this.headers, body: JSON.stringify(body) },
+      timeoutMs,
+    )
+    if (!response.ok) {
+      throw new Error(`AI request failed: ${response.status} ${await response.text()}`)
+    }
+    if (!response.body) throw new Error('AI streaming response had no body')
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+
+      // SSE frames are separated by a blank line.
+      let sep
+      while ((sep = buffer.indexOf('\n\n')) !== -1) {
+        const frame = buffer.slice(0, sep)
+        buffer = buffer.slice(sep + 2)
+        for (const line of frame.split('\n')) {
+          if (!line.startsWith('data:')) continue
+          const payload = line.slice(5).trim()
+          if (!payload || payload === '[DONE]') continue
+          try {
+            onChunk(JSON.parse(payload) as ChatCompletionStreamChunk)
+          } catch {
+            // ignore malformed frame
+          }
+        }
+      }
+    }
   }
 
   private pruneHistory(now: number) {

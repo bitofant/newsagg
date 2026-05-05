@@ -174,6 +174,71 @@ export async function pollUnmergeResult(topicId: number, waitSec = 30): Promise<
   return res.json() as Promise<UnmergeResult>
 }
 
+export type RegenSummaryResult =
+  | { mode: 'short'; summary: string }
+  | { mode: 'long'; summary: string; bullets: string[]; newInfo: string[] }
+
+export interface RegenStreamCallbacks {
+  onReasoning?: (delta: string) => void
+  onContent?: (delta: string) => void
+}
+
+export async function regenerateTopicSummary(
+  topicId: number,
+  callbacks: RegenStreamCallbacks,
+): Promise<RegenSummaryResult> {
+  const res = await fetch(`${BASE}/topics/${topicId}/regenerate-summary`, {
+    method: 'POST',
+    headers: authHeaders(),
+  })
+  if (!res.ok || !res.body) {
+    throw new Error(`Regenerate failed: ${res.status}`)
+  }
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let result: RegenSummaryResult | null = null
+  let errorMessage: string | null = null
+
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+
+    let sep
+    while ((sep = buffer.indexOf('\n\n')) !== -1) {
+      const frame = buffer.slice(0, sep)
+      buffer = buffer.slice(sep + 2)
+      let event = 'message'
+      const dataLines: string[] = []
+      for (const line of frame.split('\n')) {
+        if (line.startsWith('event:')) event = line.slice(6).trim()
+        else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
+      }
+      if (dataLines.length === 0) continue
+      let payload: unknown
+      try {
+        payload = JSON.parse(dataLines.join('\n'))
+      } catch { continue }
+
+      if (event === 'reasoning') {
+        callbacks.onReasoning?.((payload as { delta: string }).delta)
+      } else if (event === 'content') {
+        callbacks.onContent?.((payload as { delta: string }).delta)
+      } else if (event === 'done') {
+        result = payload as RegenSummaryResult
+      } else if (event === 'error') {
+        errorMessage = (payload as { error?: string }).error ?? 'regenerate failed'
+      }
+    }
+  }
+
+  if (errorMessage) throw new Error(errorMessage)
+  if (!result) throw new Error('regenerate stream ended without result')
+  return result
+}
+
 export interface DupeCandidate {
   topicIdA: number
   topicIdB: number
