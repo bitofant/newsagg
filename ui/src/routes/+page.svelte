@@ -305,10 +305,16 @@
             {#if section.topicTitle !== section.headline}
               <p class="text-xs text-stone-400 dark:text-stone-500 uppercase tracking-wide mb-1">{section.topicTitle}</p>
             {/if}
-            <p
-              class="text-sm text-stone-700 dark:text-stone-300 leading-relaxed"
+            <div
+              class="text-sm text-stone-700 dark:text-stone-300 leading-relaxed space-y-2"
               style={isMorphing ? 'view-transition-name: topic-summary' : ''}
-            >{section.summary}</p>
+            >
+              {#each section.summary.split(/\n\s*\n/) as para}
+                <p>
+                  {#if para.startsWith('New: ')}<strong class="text-amber-600 dark:text-amber-400">New:</strong> {para.slice(5)}{:else}{para}{/if}
+                </p>
+              {/each}
+            </div>
             {#if (section.bullets?.length ?? 0) + (section.newInfo?.length ?? 0) > 0}
               <ul class="mt-3 space-y-1 list-disc list-inside text-sm text-stone-700 dark:text-stone-300 leading-relaxed">
                 {#each section.newInfo ?? [] as item}

@@ -28,6 +28,12 @@ Reasoning content is read from `message.reasoning_content` *or* `message.reasoni
 
 `opts.timeoutMs` overrides `config.ai.requestTimeoutMs` for one call. `npm run llm-test` uses 30s.
 
+## `completeStream(prompt, opts, callbacks)`
+
+Streaming counterpart of `complete()`. Sends `stream: true` + `stream_options: { include_usage: true }` and parses `data: {...}\n\n` SSE frames from the response body. Dispatches each delta via `callbacks.onReasoning(delta)` (from `delta.reasoning_content ?? delta.reasoning`) and `callbacks.onContent(delta)` (from `delta.content`). Same lifecycle as `complete()`: `ensureInitialized()`, priority gate, per-call timeout, metrics window, and `llm/{day}/...` log files (written once at the end). Returns the full accumulated content string.
+
+Used today only by `consolidator.regenerateTopicSummaryWithReasoning` (manual on-demand regen from the topic detail page). Reasoning-on calls floor `max_tokens` to `MAX_OUTPUT_TOKENS_REASONING` via `maxOutputFor()` — same as `complete()`.
+
 ## Logging
 
 Every `complete()` call writes 3 files to `llm/{YYYYMMDD}/` (gitignored): `{unix_ts}_{seq}.req` (request JSON), `{unix_ts}_{seq}.res` (response text), `{unix_ts}_{seq}.think` (reasoning text, if present). The `{seq}` suffix is a per-process monotonic counter so concurrent calls in the same second don't overwrite each other. Fire-and-forget, never blocks inference.

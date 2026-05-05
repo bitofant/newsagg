@@ -18,6 +18,8 @@ SvelteKit SPA + Tailwind CSS, served as static files by the Fastify backend. Rea
 
 Clicking the title/summary area of a card navigates to a polished, hero-style view (larger typography, roomier `max-w-2xl` layout, labelled action buttons). Loads bundled topic metadata + articles + read state via `GET /api/topics/:topicId`. Shareable URL. Same vote / read / ungroup actions as the card. Empty topics (after ungroup) redirect to `/`.
 
+**Regenerate button** (`Sparkles`, always visible, disabled when `articles.length < 2`): rebuilds the topic summary at `reasoningEffort: 'high'`, streamed live. Driven by `POST /api/topics/:id/regenerate-summary` which is an SSE endpoint with `reasoning` / `content` / `done` / `error` events, parsed client-side via `regenerateTopicSummary()` (uses `fetch` + `ReadableStream`, not `EventSource`, so it can POST with the auth header). UX: button label flips Thinking… → Writing… as soon as content tokens start arriving; an open `<details>` "Reasoning" panel shows the live `<think>` text in muted monospace. Short-mode: the summary paragraph is replaced live as content streams. Long-mode: the existing summary/bullets stay visible during streaming (raw JSON would be ugly), and swap atomically on `done`. Front-page card stays stale until next aggregator tick — same deferred-rewrite tradeoff as merge.
+
 ## Unmerge overlay
 
 Per-topic unmerge button on both card and detail page opens an absolutely-positioned overlay with four phases:
