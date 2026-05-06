@@ -38,13 +38,32 @@ Used today only by `consolidator.regenerateTopicSummaryWithReasoning` (manual on
 
 Every `complete()` call writes 3 files to `llm/{YYYYMMDD}/` (gitignored): `{unix_ts}_{seq}.req` (request JSON), `{unix_ts}_{seq}.res` (response text), `{unix_ts}_{seq}.think` (reasoning text, if present). The `{seq}` suffix is a per-process monotonic counter so concurrent calls in the same second don't overwrite each other. Fire-and-forget, never blocks inference.
 
+## Health gate (pause-on-outage)
+
+Every `complete()` / `completeStream()` runs inside a retry loop:
+1. `ensureInitialized()` (retried on transient errors — a process started while the LLM is still booting keeps trying rather than hard-failing).
+2. `awaitHealthy()` — blocks if the probe loop has flagged the backend as down. **Crucially, this happens BEFORE acquiring a permit from the priority gate**, so paused calls do not consume `maxConcurrency` slots while waiting.
+3. Acquire permit, dispatch.
+4. On retryable failure: release permit, mark unhealthy, loop back to step 2.
+
+Retryable = `AbortError` (per-call timeout fired), `TypeError` (fetch threw — connection refused / DNS / reset), HTTP 5xx / 503 / 429 / 408. Everything else (4xx, JSON parse, etc.) propagates so real bugs surface immediately.
+
+`markUnhealthy()` is idempotent and starts a probe loop (`HEALTH_PROBE_INTERVAL_MS = 5s`, `HEALTH_PROBE_TIMEOUT_MS = 5s`). `VllmProvider.probeHealth` hits `/health` (vLLM's dedicated readiness endpoint at the server root, **not** under `/v1`); `OllamaProvider.probeHealth` hits the base `/`. On the first successful probe, the flag flips back to healthy and all queued waiters fire — every paused `complete()` call resumes its retry loop in parallel. Initial probe runs after one interval, not immediately, so a transient blip isn't mistaken for recovery.
+
+Together with the consolidator's durable ingest queue (`@docs/consolidator.md`), this means: LLM goes down → drains call `complete()`, which blocks → `ingest_queue` rows pile up safely in SQLite → restart anytime is harmless → LLM comes back → probe flips healthy → all waiters resume.
+
+No retry cap. The user's framing ("we can also just keep retrying queries until they succeed") is taken literally; a permanently dead backend pauses processing forever, surfaced via `status().healthy=false` and on `/status` as a red banner.
+
 ## Metrics
 
-Each call records `{startedAt, endedAt, promptTokens, completionTokens, reasoningTokens, cachedTokens}` in a rolling window (`ai.statusWindowMs`, default 10 min). Surfaced via `status()` as `busyPct`, `reqPerMin`, `tokPerSec`, `reasoningTokPerSec` (non-zero only for reasoning models), `cacheHitPct` (vLLM prefix-cache share of prompt tokens; 0 on Ollama), plus live gate stats `inFlight`, `queueDepthNormal`, `queueDepthLow`, `maxConcurrency`. `reasoningTokPerSec` is shown on `/status` only when non-zero.
+Each call records `{startedAt, endedAt, promptTokens, completionTokens, reasoningTokens, cachedTokens}` in a rolling window (`ai.statusWindowMs`, default 10 min). Surfaced via `status()` as `busyPct`, `reqPerMin`, `tokPerSec`, `reasoningTokPerSec` (non-zero only for reasoning models), `cacheHitPct` (vLLM prefix-cache share of prompt tokens; 0 on Ollama), plus live gate stats `inFlight`, `queueDepthNormal`, `queueDepthLow`, `maxConcurrency`, plus health flags `healthy`, `unhealthyReason`, `unhealthySince`. `reasoningTokPerSec` is shown on `/status` only when non-zero; an unhealthy state shows a red banner with the last error and downtime so far.
 
 `cachedTokens` is read from `usage.prompt_tokens_details.cached_tokens` — vLLM emits this when prefix caching is on (default since 0.4). vLLM-side hit rate is also exposed via `vllm:gpu_prefix_cache_hit_rate` on the server's `/metrics` endpoint.
 
 ## Design decisions
+
+### Health gate pauses dispatch instead of failing calls (2026-05-06)
+On transient backend failures (network errors, timeouts, 5xx responses), `complete()` does not throw — it marks the provider unhealthy, releases its permit, blocks on `awaitHealthy()`, and retries once a `/health` probe succeeds. Rationale: pairing this with the consolidator's durable `ingest_queue` (see `@docs/consolidator.md`) gives end-to-end "no data lost on LLM outage or process restart". Previously, a downed LLM caused `processBatch` to throw, the consolidator's catch block logged it, and the in-memory `buffer.splice(...)`d articles were silently dropped — the next RSS poll could only re-discover articles still inside the feed's retention window. The retry happens inside `complete()` so consumers don't need outage-aware code; they just await the call. The gate sits *before* permit acquisition so paused calls don't consume `maxConcurrency` (otherwise 12 stuck retries would block all new work). Probe interval is 5s; first probe runs after 5s rather than immediately so a momentary blip isn't mistaken for recovery. Health is binary, not a circuit breaker with half-open states — single-process, hobby-grade, and the user's stated preference is "just keep retrying until it succeeds".
 
 ### LLM response code-fence stripping (2026-04-10)
 Both consolidator and aggregator strip markdown code fences (` ```json ... ``` `) from LLM responses before JSON parsing via `stripCodeFences()`. Models (especially Gemma 4) wrap JSON in code fences despite explicit "no code fences" prompts. Without stripping, all `JSON.parse()` calls fail.

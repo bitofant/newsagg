@@ -45,6 +45,12 @@ export interface ProviderStatus {
   queueDepthLow: number
   /** Configured cap on in-flight requests (`config.ai.maxConcurrency`). */
   maxConcurrency: number
+  /** False while the health probe is failing — `complete()` calls block at the gate until probe recovers. */
+  healthy: boolean
+  /** Last unhealthiness reason (human-readable error summary). Cleared once health is restored. */
+  unhealthyReason: string | null
+  /** Unix-ms timestamp of when the current outage started. Null when healthy. */
+  unhealthySince: number | null
 }
 
 interface ChatMessage {
@@ -108,6 +114,11 @@ export const MAX_OUTPUT_TOKENS = 4096
 /** Hard cap on output tokens when reasoning is ENABLED — reasoning tokens count against this budget on vLLM (qwen3 parser), so we double it. */
 export const MAX_OUTPUT_TOKENS_REASONING = 8192
 
+/** Interval between probe attempts while the LLM is unhealthy. */
+const HEALTH_PROBE_INTERVAL_MS = 5_000
+/** Timeout for one health-probe HTTP request. Kept short so a hung backend trips fast. */
+const HEALTH_PROBE_TIMEOUT_MS = 5_000
+
 /**
  * Process-wide concurrency gate with two priorities. Normal queue is fully drained before low queue —
  * intentional starvation of low under sustained normal load (see docs/ai.md).
@@ -165,6 +176,11 @@ export abstract class InferenceProvider {
   private readonly gate: PriorityGate
   private callHistory: CallRecord[] = []
   private initPromise?: Promise<void>
+  private healthy = true
+  private unhealthyReason: string | null = null
+  private unhealthySince: number | null = null
+  private healthWaiters: Array<() => void> = []
+  private healthProbeTimer: ReturnType<typeof setTimeout> | null = null
 
   constructor(protected readonly config: AiConfig) {
     this.resolvedModel = typeof config.model === 'string' ? config.model : ''
@@ -198,68 +214,172 @@ export abstract class InferenceProvider {
 
   protected abstract doInit(): Promise<void>
 
+  /** Backend-specific cheap health check: vLLM `/health`, Ollama base `/`. Returns true if alive. */
+  protected abstract probeHealth(timeoutMs: number): Promise<boolean>
+
+  /** Block until the health flag flips back to true. Returns immediately if already healthy. */
+  private awaitHealthy(): Promise<void> {
+    if (this.healthy) return Promise.resolve()
+    return new Promise<void>((resolve) => {
+      this.healthWaiters.push(resolve)
+    })
+  }
+
+  /**
+   * Flip to unhealthy and start (idempotently) the probe loop. Calls already past `awaitHealthy()`
+   * keep their permits but their retry-loop body re-enters `awaitHealthy()` after this returns.
+   * New calls block at the gate-front `awaitHealthy()` and wait without holding permits.
+   */
+  private markUnhealthy(reason: string): void {
+    if (!this.healthy) return
+    this.healthy = false
+    this.unhealthyReason = reason
+    this.unhealthySince = Date.now()
+    console.warn(`[ai] LLM unhealthy: ${reason} — pausing dispatch and probing every ${HEALTH_PROBE_INTERVAL_MS}ms`)
+    this.scheduleProbe()
+  }
+
+  private scheduleProbe(): void {
+    if (this.healthProbeTimer) return
+    const tick = async () => {
+      this.healthProbeTimer = null
+      let alive = false
+      try {
+        alive = await this.probeHealth(HEALTH_PROBE_TIMEOUT_MS)
+      } catch {
+        alive = false
+      }
+      if (alive) {
+        const downtimeMs = this.unhealthySince != null ? Date.now() - this.unhealthySince : 0
+        console.log(`[ai] LLM healthy again after ${(downtimeMs / 1000).toFixed(1)}s`)
+        this.healthy = true
+        this.unhealthyReason = null
+        this.unhealthySince = null
+        const waiters = this.healthWaiters
+        this.healthWaiters = []
+        for (const w of waiters) w()
+        return
+      }
+      this.healthProbeTimer = setTimeout(tick, HEALTH_PROBE_INTERVAL_MS)
+    }
+    // First probe runs after one interval so a transient blip isn't mistaken for recovery.
+    this.healthProbeTimer = setTimeout(tick, HEALTH_PROBE_INTERVAL_MS)
+  }
+
+  /**
+   * Classify a thrown error as a transient backend-availability problem (retry after probe) vs.
+   * a real client error (propagate). Network errors, AbortError (timeout), and 5xx/503 responses
+   * are retryable; other failures (4xx, JSON parse, etc.) are not.
+   */
+  private isRetryableError(err: unknown): boolean {
+    if (!(err instanceof Error)) return false
+    if (err.name === 'AbortError') return true
+    // node fetch wraps low-level connection errors in TypeError with a `cause`.
+    if (err.name === 'TypeError') return true
+    const msg = err.message
+    // `fetchChatCompletion` formats non-OK responses as "AI request failed: <status> ...".
+    if (/^AI request failed: 5\d\d/.test(msg)) return true
+    if (/^AI request failed: 408 /.test(msg)) return true
+    if (/^AI request failed: 429 /.test(msg)) return true
+    if (/timeout/i.test(msg)) return true
+    return false
+  }
+
+  private errSummary(err: unknown): string {
+    if (err instanceof Error) return `${err.name}: ${err.message}`
+    return String(err)
+  }
+
   async complete(prompt: string, opts?: CompleteOptions): Promise<string> {
-    await this.ensureInitialized()
+    // Retry-on-transient-failure loop. Pause inside `awaitHealthy()` (no permit held) when the
+    // probe loop has flagged the backend as down. Init is also retryable — a process started while
+    // the LLM is still booting will keep retrying init via this loop rather than hard-failing.
+    while (true) {
+      try {
+        await this.ensureInitialized()
+      } catch (err) {
+        if (this.isRetryableError(err)) {
+          this.markUnhealthy(`init: ${this.errSummary(err)}`)
+          await this.awaitHealthy()
+          continue
+        }
+        throw err
+      }
+      await this.awaitHealthy()
 
-    const messages: ChatMessage[] = []
-    if (opts?.systemPrompt) messages.push({ role: 'system', content: opts.systemPrompt })
-    messages.push({ role: 'user', content: prompt })
+      const messages: ChatMessage[] = []
+      if (opts?.systemPrompt) messages.push({ role: 'system', content: opts.systemPrompt })
+      messages.push({ role: 'user', content: prompt })
 
-    const body: Record<string, unknown> = {
-      model: this.resolvedModel,
-      messages,
-      max_tokens: maxOutputFor(opts),
-    }
-    if (opts?.reasoningEffort === 'off') {
-      body['chat_template_kwargs'] = { enable_thinking: false }
-    } else if (opts?.reasoningEffort) {
-      body['reasoning_effort'] = opts.reasoningEffort
-    }
-
-    // Acquire AFTER ensureInitialized + body assembly so the timeout (started inside fetchChatCompletion)
-    // does not tick during queue wait — a low-priority call that waits 10 minutes behind normal traffic
-    // must not spuriously time out before it gets dispatched.
-    const release = await this.gate.acquire(opts?.priority ?? 'normal')
-    try {
-      const timestamp = Math.floor(Date.now() / 1000)
-      const seq = logCallSeq++
-      const startedAt = Date.now()
-      const timeoutMs = opts?.timeoutMs ?? this.config.requestTimeoutMs
-
-      const data = await this.fetchChatCompletion(body, timeoutMs)
-      const endedAt = Date.now()
-
-      if (opts?.verbose) {
-        console.log('[ai] raw chat-completion response:')
-        console.log(JSON.stringify(data, null, 2))
+      const body: Record<string, unknown> = {
+        model: this.resolvedModel,
+        messages,
+        max_tokens: maxOutputFor(opts),
+      }
+      if (opts?.reasoningEffort === 'off') {
+        body['chat_template_kwargs'] = { enable_thinking: false }
+      } else if (opts?.reasoningEffort) {
+        body['reasoning_effort'] = opts.reasoningEffort
       }
 
-      const msg = data.choices[0]!.message
-      const reasoning = msg.reasoning_content ?? msg.reasoning
-      // vLLM with the qwen3 parser does NOT break out reasoning_tokens in usage — it lumps them
-      // into completion_tokens. Estimate from reasoning text length (~4 chars/token) as a fallback
-      // so the rolling-window metric reflects reality on those backends.
-      const reportedReasoningTokens = data.usage?.completion_tokens_details?.reasoning_tokens ?? 0
-      const reasoningTokens = reportedReasoningTokens > 0
-        ? reportedReasoningTokens
-        : reasoning
-          ? Math.ceil(reasoning.length / 4)
-          : 0
+      // Acquire AFTER ensureInitialized + awaitHealthy + body assembly so the timeout (started
+      // inside fetchChatCompletion) does not tick during queue wait — a low-priority call that
+      // waits 10 minutes behind normal traffic must not spuriously time out before dispatch.
+      const release = await this.gate.acquire(opts?.priority ?? 'normal')
+      let releaseCalled = false
+      try {
+        const timestamp = Math.floor(Date.now() / 1000)
+        const seq = logCallSeq++
+        const startedAt = Date.now()
+        const timeoutMs = opts?.timeoutMs ?? this.config.requestTimeoutMs
 
-      this.callHistory.push({
-        startedAt,
-        endedAt,
-        promptTokens: data.usage?.prompt_tokens ?? 0,
-        completionTokens: data.usage?.completion_tokens ?? 0,
-        reasoningTokens,
-        cachedTokens: data.usage?.prompt_tokens_details?.cached_tokens ?? 0,
-      })
-      this.pruneHistory(endedAt)
+        let data: ChatCompletionResponse
+        try {
+          data = await this.fetchChatCompletion(body, timeoutMs)
+        } catch (err) {
+          if (this.isRetryableError(err)) {
+            this.markUnhealthy(`complete: ${this.errSummary(err)}`)
+            release()
+            releaseCalled = true
+            await this.awaitHealthy()
+            continue
+          }
+          throw err
+        }
+        const endedAt = Date.now()
 
-      logLlmCall(timestamp, seq, { model: this.resolvedModel, messages }, msg.content, reasoning)
-      return msg.content
-    } finally {
-      release()
+        if (opts?.verbose) {
+          console.log('[ai] raw chat-completion response:')
+          console.log(JSON.stringify(data, null, 2))
+        }
+
+        const msg = data.choices[0]!.message
+        const reasoning = msg.reasoning_content ?? msg.reasoning
+        // vLLM with the qwen3 parser does NOT break out reasoning_tokens in usage — it lumps them
+        // into completion_tokens. Estimate from reasoning text length (~4 chars/token) as a fallback
+        // so the rolling-window metric reflects reality on those backends.
+        const reportedReasoningTokens = data.usage?.completion_tokens_details?.reasoning_tokens ?? 0
+        const reasoningTokens = reportedReasoningTokens > 0
+          ? reportedReasoningTokens
+          : reasoning
+            ? Math.ceil(reasoning.length / 4)
+            : 0
+
+        this.callHistory.push({
+          startedAt,
+          endedAt,
+          promptTokens: data.usage?.prompt_tokens ?? 0,
+          completionTokens: data.usage?.completion_tokens ?? 0,
+          reasoningTokens,
+          cachedTokens: data.usage?.prompt_tokens_details?.cached_tokens ?? 0,
+        })
+        this.pruneHistory(endedAt)
+
+        logLlmCall(timestamp, seq, { model: this.resolvedModel, messages }, msg.content, reasoning)
+        return msg.content
+      } finally {
+        if (!releaseCalled) release()
+      }
     }
   }
 
@@ -269,73 +389,100 @@ export abstract class InferenceProvider {
    * via callbacks; returns the full accumulated content string.
    */
   async completeStream(prompt: string, opts: CompleteOptions | undefined, callbacks: StreamCallbacks): Promise<string> {
-    await this.ensureInitialized()
-
-    const messages: ChatMessage[] = []
-    if (opts?.systemPrompt) messages.push({ role: 'system', content: opts.systemPrompt })
-    messages.push({ role: 'user', content: prompt })
-
-    const body: Record<string, unknown> = {
-      model: this.resolvedModel,
-      messages,
-      max_tokens: maxOutputFor(opts),
-      stream: true,
-      stream_options: { include_usage: true },
-    }
-    if (opts?.reasoningEffort === 'off') {
-      body['chat_template_kwargs'] = { enable_thinking: false }
-    } else if (opts?.reasoningEffort) {
-      body['reasoning_effort'] = opts.reasoningEffort
-    }
-
-    const release = await this.gate.acquire(opts?.priority ?? 'normal')
-    try {
-      const timestamp = Math.floor(Date.now() / 1000)
-      const seq = logCallSeq++
-      const startedAt = Date.now()
-      const timeoutMs = opts?.timeoutMs ?? this.config.requestTimeoutMs
-
-      let content = ''
-      let reasoning = ''
-      let usage: ChatCompletionUsage | undefined
-      await this.streamChatCompletion(body, timeoutMs, (chunk) => {
-        const delta = chunk.choices?.[0]?.delta
-        if (delta) {
-          if (delta.content) {
-            content += delta.content
-            callbacks.onContent?.(delta.content)
-          }
-          const reasoningDelta = delta.reasoning_content ?? delta.reasoning
-          if (reasoningDelta) {
-            reasoning += reasoningDelta
-            callbacks.onReasoning?.(reasoningDelta)
-          }
+    // Streaming is only used for user-driven manual regen, where partial progress on a connection
+    // failure is awkward to expose mid-stream. The retry loop wraps the whole stream attempt; a
+    // failed connection restarts from scratch (callbacks see the new stream's deltas, not the old).
+    while (true) {
+      try {
+        await this.ensureInitialized()
+      } catch (err) {
+        if (this.isRetryableError(err)) {
+          this.markUnhealthy(`init: ${this.errSummary(err)}`)
+          await this.awaitHealthy()
+          continue
         }
-        if (chunk.usage) usage = chunk.usage
-      })
-      const endedAt = Date.now()
+        throw err
+      }
+      await this.awaitHealthy()
 
-      const reportedReasoningTokens = usage?.completion_tokens_details?.reasoning_tokens ?? 0
-      const reasoningTokens = reportedReasoningTokens > 0
-        ? reportedReasoningTokens
-        : reasoning
-          ? Math.ceil(reasoning.length / 4)
-          : 0
+      const messages: ChatMessage[] = []
+      if (opts?.systemPrompt) messages.push({ role: 'system', content: opts.systemPrompt })
+      messages.push({ role: 'user', content: prompt })
 
-      this.callHistory.push({
-        startedAt,
-        endedAt,
-        promptTokens: usage?.prompt_tokens ?? 0,
-        completionTokens: usage?.completion_tokens ?? 0,
-        reasoningTokens,
-        cachedTokens: usage?.prompt_tokens_details?.cached_tokens ?? 0,
-      })
-      this.pruneHistory(endedAt)
+      const body: Record<string, unknown> = {
+        model: this.resolvedModel,
+        messages,
+        max_tokens: maxOutputFor(opts),
+        stream: true,
+        stream_options: { include_usage: true },
+      }
+      if (opts?.reasoningEffort === 'off') {
+        body['chat_template_kwargs'] = { enable_thinking: false }
+      } else if (opts?.reasoningEffort) {
+        body['reasoning_effort'] = opts.reasoningEffort
+      }
 
-      logLlmCall(timestamp, seq, { model: this.resolvedModel, messages }, content, reasoning || undefined)
-      return content
-    } finally {
-      release()
+      const release = await this.gate.acquire(opts?.priority ?? 'normal')
+      let releaseCalled = false
+      try {
+        const timestamp = Math.floor(Date.now() / 1000)
+        const seq = logCallSeq++
+        const startedAt = Date.now()
+        const timeoutMs = opts?.timeoutMs ?? this.config.requestTimeoutMs
+
+        let content = ''
+        let reasoning = ''
+        let usage: ChatCompletionUsage | undefined
+        try {
+          await this.streamChatCompletion(body, timeoutMs, (chunk) => {
+            const delta = chunk.choices?.[0]?.delta
+            if (delta) {
+              if (delta.content) {
+                content += delta.content
+                callbacks.onContent?.(delta.content)
+              }
+              const reasoningDelta = delta.reasoning_content ?? delta.reasoning
+              if (reasoningDelta) {
+                reasoning += reasoningDelta
+                callbacks.onReasoning?.(reasoningDelta)
+              }
+            }
+            if (chunk.usage) usage = chunk.usage
+          })
+        } catch (err) {
+          if (this.isRetryableError(err)) {
+            this.markUnhealthy(`completeStream: ${this.errSummary(err)}`)
+            release()
+            releaseCalled = true
+            await this.awaitHealthy()
+            continue
+          }
+          throw err
+        }
+        const endedAt = Date.now()
+
+        const reportedReasoningTokens = usage?.completion_tokens_details?.reasoning_tokens ?? 0
+        const reasoningTokens = reportedReasoningTokens > 0
+          ? reportedReasoningTokens
+          : reasoning
+            ? Math.ceil(reasoning.length / 4)
+            : 0
+
+        this.callHistory.push({
+          startedAt,
+          endedAt,
+          promptTokens: usage?.prompt_tokens ?? 0,
+          completionTokens: usage?.completion_tokens ?? 0,
+          reasoningTokens,
+          cachedTokens: usage?.prompt_tokens_details?.cached_tokens ?? 0,
+        })
+        this.pruneHistory(endedAt)
+
+        logLlmCall(timestamp, seq, { model: this.resolvedModel, messages }, content, reasoning || undefined)
+        return content
+      } finally {
+        if (!releaseCalled) release()
+      }
     }
   }
 
@@ -344,11 +491,17 @@ export abstract class InferenceProvider {
     this.pruneHistory(now)
     const gateStats = this.gate.stats()
     const maxConcurrency = this.config.maxConcurrency
+    const healthFields = {
+      healthy: this.healthy,
+      unhealthyReason: this.unhealthyReason,
+      unhealthySince: this.unhealthySince,
+    }
     if (this.callHistory.length === 0) {
       return {
         busyPct: 0, reqPerMin: 0, tokPerSec: 0, reasoningTokPerSec: 0, cacheHitPct: 0,
         windowMs: this.config.statusWindowMs,
         ...gateStats, maxConcurrency,
+        ...healthFields,
       }
     }
     let totalDurationMs = 0
@@ -373,6 +526,7 @@ export abstract class InferenceProvider {
       busyPct, reqPerMin, tokPerSec, reasoningTokPerSec, cacheHitPct,
       windowMs: this.config.statusWindowMs,
       ...gateStats, maxConcurrency,
+      ...healthFields,
     }
   }
 

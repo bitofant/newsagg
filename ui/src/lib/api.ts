@@ -320,7 +320,8 @@ export interface Status {
   llm: {
     busyPct: number; reqPerMin: number; tokPerSec: number; reasoningTokPerSec: number;
     cacheHitPct: number; windowMs: number;
-    inFlight: number; queueDepthNormal: number; queueDepthLow: number; maxConcurrency: number
+    inFlight: number; queueDepthNormal: number; queueDepthLow: number; maxConcurrency: number;
+    healthy: boolean; unhealthyReason: string | null; unhealthySince: number | null
   }
   consolidator: { bufferDepth: number; processing: boolean; pendingRegens: number; estimatedBehindMs: number | null }
   aggregator: { queueLength: number; activeWorkers: number }

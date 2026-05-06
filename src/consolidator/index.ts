@@ -116,8 +116,8 @@ export function createConsolidator({
   config: ConsolidatorConfig
   embedding: EmbeddingConfig
 }): Consolidator {
-  const buffer: RawArticle[] = []
-  const pendingUrls = new Set<string>()
+  // Pending article queue is in `db.news.ingest_queue` — durable across restarts and LLM outages.
+  // The previous in-memory `buffer: RawArticle[]` lost articles on kill/LLM-fail.
   const pendingRegenTopicIds = new Set<number>()
   let timer: ReturnType<typeof setInterval> | null = null
   let processing = false
@@ -126,11 +126,15 @@ export function createConsolidator({
   const batchHistory: { startedAt: number; endedAt: number; articleCount: number }[] = []
 
   function enqueue(article: RawArticle) {
-    // Dedup: skip if already queued, or already saved to DB
-    if (pendingUrls.has(article.url)) return
+    // Skip articles already saved to the DB. Queue-side dedup is enforced by the UNIQUE constraint
+    // on `ingest_queue.url`, so re-polling the same RSS feed for an already-queued URL is a no-op.
     if (db.news.articleExistsByUrl(article.url)) return
-    buffer.push(article)
-    pendingUrls.add(article.url)
+    db.news.ingestArticle({
+      source: article.source,
+      url: article.url,
+      title: article.title,
+      text: article.text,
+    })
   }
 
   function enqueueRegen(topicId: number) {
@@ -217,7 +221,8 @@ export function createConsolidator({
 
   async function drain() {
     if (processing) return
-    if (buffer.length === 0 && pendingRegenTopicIds.size === 0) return
+    const queueDepth = db.news.ingestQueueDepth()
+    if (queueDepth === 0 && pendingRegenTopicIds.size === 0) return
     if (backfillReady) {
       // Block the first drain on initial embedding backfill so the pre-filter runs against complete
       // topic coverage. Subsequent drains see a resolved promise (effectively a no-op await) and we
@@ -228,11 +233,13 @@ export function createConsolidator({
     }
     processing = true
     try {
-      if (buffer.length > 0) {
-        const batch = buffer.splice(0, ARTICLE_BATCH_SIZE)
-        for (const a of batch) pendingUrls.delete(a.url)
-
-        // Safety net: filter out anything that landed in DB between enqueue and drain
+      if (queueDepth > 0) {
+        // Read-then-delete-on-success: the queue rows stay in SQLite until processBatch fully
+        // succeeds. A mid-batch crash, kill, or LLM failure leaves the rows in place; the next
+        // drain re-reads and retries. The `fresh` filter handles partial progress (some articles
+        // were added to `articles` before the failure) — already-saved URLs get queued for cleanup
+        // without being re-processed.
+        const batch = db.news.listIngestQueueBatch(ARTICLE_BATCH_SIZE)
         const fresh = batch.filter((a) => !db.news.articleExistsByUrl(a.url))
         if (fresh.length > 0) {
           const ai = getAi()
@@ -251,16 +258,21 @@ export function createConsolidator({
             batchHistory.shift()
           }
         }
+        // Reaching here means processBatch succeeded (or was skipped because nothing was fresh):
+        // it is safe to drop the queue rows for this batch.
+        db.news.deleteIngestQueueByIds(batch.map((b) => b.id))
       }
 
       if (pendingRegenTopicIds.size > 0) {
         const ids = [...pendingRegenTopicIds]
-        pendingRegenTopicIds.clear()
         try {
           const ai = getAi()
           await ai.ensureInitialized()
           const startedAt = Date.now()
           await regenerateAndEmbed(ai, ids)
+          // Only clear the regen set after the work succeeds. On failure (e.g. LLM down) the ids
+          // stay queued and the next drain retries them, mirroring the article-queue behavior.
+          for (const id of ids) pendingRegenTopicIds.delete(id)
           console.log(`[consolidator] background regen for ${ids.length} topic(s) in ${Date.now() - startedAt}ms`)
         } catch (err) {
           console.error('[consolidator] background regen error:', err)
@@ -691,6 +703,7 @@ export function createConsolidator({
     mergeTopic,
     regenerateTopicSummaryWithReasoning,
     status() {
+      const bufferDepth = db.news.ingestQueueDepth()
       let estimatedBehindMs: number | null = null
 
       if (batchHistory.length > 0) {
@@ -703,11 +716,11 @@ export function createConsolidator({
 
         if (totalArticles > 0 && totalProcessingMs > 0) {
           const msPerArticle = totalProcessingMs / totalArticles
-          estimatedBehindMs = Math.round(buffer.length * msPerArticle)
+          estimatedBehindMs = Math.round(bufferDepth * msPerArticle)
         }
       }
 
-      return { bufferDepth: buffer.length, processing, pendingRegens: pendingRegenTopicIds.size, estimatedBehindMs }
+      return { bufferDepth, processing, pendingRegens: pendingRegenTopicIds.size, estimatedBehindMs }
     },
     start() {
       // Kick off the embedding backfill in the background. The first drain awaits this; we don't

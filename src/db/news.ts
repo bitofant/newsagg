@@ -130,6 +130,24 @@ export interface NewsDb {
   dismissDupeCandidate(topicIdA: number, topicIdB: number): void
   /** All previously-dismissed pairs. Used by the finder to exclude them from new candidate runs. */
   listDupeDismissalPairs(): Array<{ topicIdA: number; topicIdB: number }>
+  // --- Ingest queue (pre-consolidation buffer) ---
+  /** Insert an article into the ingest queue. INSERT OR IGNORE on `url`; returns true if a new row was inserted. */
+  ingestArticle(article: { source: string; url: string; title: string; text: string }): boolean
+  /** Read the oldest `limit` rows from the ingest queue. */
+  listIngestQueueBatch(limit: number): IngestQueueRow[]
+  /** Bulk-delete ingest queue rows by id. Called only after the consolidator has fully processed the batch. */
+  deleteIngestQueueByIds(ids: number[]): void
+  /** Current depth of the ingest queue. */
+  ingestQueueDepth(): number
+}
+
+export interface IngestQueueRow {
+  id: number
+  source: string
+  url: string
+  title: string
+  text: string
+  fetchedAt: number
 }
 
 function float32ArrayToBlob(arr: Float32Array): Buffer {
@@ -493,6 +511,49 @@ export function createNewsDb(db: DatabaseSync): NewsDb {
         .prepare('SELECT topic_id_a, topic_id_b FROM topic_dupe_dismissals')
         .all() as Array<{ topic_id_a: number; topic_id_b: number }>
       return rows.map((r) => ({ topicIdA: r.topic_id_a, topicIdB: r.topic_id_b }))
+    },
+
+    ingestArticle({ source, url, title, text }) {
+      const result = db
+        .prepare(
+          'INSERT OR IGNORE INTO ingest_queue (source, url, title, text, fetched_at) VALUES (?, ?, ?, ?, ?)',
+        )
+        .run(source, url, title, text, Date.now())
+      return result.changes > 0
+    },
+
+    listIngestQueueBatch(limit) {
+      const rows = db
+        .prepare(
+          'SELECT id, source, url, title, text, fetched_at FROM ingest_queue ORDER BY id ASC LIMIT ?',
+        )
+        .all(limit) as Array<{
+        id: number
+        source: string
+        url: string
+        title: string
+        text: string
+        fetched_at: number
+      }>
+      return rows.map((r) => ({
+        id: r.id,
+        source: r.source,
+        url: r.url,
+        title: r.title,
+        text: r.text,
+        fetchedAt: r.fetched_at,
+      }))
+    },
+
+    deleteIngestQueueByIds(ids) {
+      if (ids.length === 0) return
+      const placeholders = ids.map(() => '?').join(',')
+      db.prepare(`DELETE FROM ingest_queue WHERE id IN (${placeholders})`).run(...ids)
+    },
+
+    ingestQueueDepth() {
+      const row = db.prepare('SELECT COUNT(*) as count FROM ingest_queue').get() as { count: number }
+      return row.count
     },
   }
 }

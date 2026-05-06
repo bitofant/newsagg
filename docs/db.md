@@ -14,6 +14,7 @@ Column mapping snake_case (SQL) → camelCase (TS) is done at the DB layer bound
   - `embedding_model` (TEXT, nullable): the `Embedder.model` value that produced the bytes. Topics whose stored model doesn't match `config.embedding.model` are treated as missing and re-embedded by the backfill loop on next startup, so model swaps never silently produce mixed-vector cosines.
 - **`articles`** — title, text, timestamp, source, url. `articles.topic_id` column remains (SQLite can't drop columns) but is vestigial.
 - **`article_topics`** — junction table for the many-to-many article↔topic relationship (see decision below). All queries use this; the legacy `articles.topic_id` is unused.
+- **`ingest_queue`** — pre-consolidation buffer the grabber writes into and the consolidator drains. Unique on `url`. Rows are deleted only after the consolidator has fully processed them (see "Durable ingest queue" below).
 
 ## User DB (`src/db/users.ts`)
 
@@ -26,6 +27,9 @@ Column mapping snake_case (SQL) → camelCase (TS) is done at the DB layer bound
 - **`front_pages`** — generated front pages persisted as JSON blobs (see "Front pages persisted in SQLite" below).
 
 ## Design decisions
+
+### Durable ingest queue (2026-05-06)
+`ingest_queue` mirrors the same durability decision as `signal_queue` and `front_pages`: the grabber → consolidator handoff is in SQLite, not a JS array. Consolidator reads top N rows, processes, and only after `processBatch` succeeds does it delete the rows; mid-batch crash or LLM outage leaves rows in place for the next drain to retry. The UNIQUE constraint on `url` makes RSS re-polls idempotent (`INSERT OR IGNORE`). Rationale: the previous in-memory buffer dropped articles on `./restart.sh` mid-drain or on any thrown error from a batch (the catch-and-log path discarded the spliced batch). Pairs with the LLM health gate in `@docs/ai.md` for end-to-end outage tolerance — pause processing without losing anything.
 
 ### `node:sqlite` over `better-sqlite3` (2026-04-07)
 Node 22.5+ ships built-in SQLite. Avoids native addon compilation issues (which broke on Node 25) and removes a heavyweight dependency. The API is synchronous like `better-sqlite3`. It's marked "experimental" but is stable enough for this use case.

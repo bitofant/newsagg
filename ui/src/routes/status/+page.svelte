@@ -103,6 +103,13 @@
 
       <div class="bg-white dark:bg-stone-900 rounded-xl shadow-sm p-5">
         <h2 class="text-xs uppercase tracking-wide text-stone-500 dark:text-stone-400 mb-3">LLM ({formatDuration(status.llm.windowMs)})</h2>
+        {#if !status.llm.healthy}
+          <div class="mb-3 rounded-md border border-red-300 dark:border-red-700 bg-red-50 dark:bg-red-950/40 px-3 py-2 text-sm text-red-800 dark:text-red-300">
+            <div class="font-semibold">LLM unavailable — processing paused</div>
+            {#if status.llm.unhealthyReason}<div class="font-mono text-xs mt-1 break-all">{status.llm.unhealthyReason}</div>{/if}
+            {#if status.llm.unhealthySince}<div class="text-xs mt-1">down for {formatDuration(Date.now() - status.llm.unhealthySince)}</div>{/if}
+          </div>
+        {/if}
         <div class="flex items-baseline justify-between mb-1">
           <span class="text-sm text-stone-600 dark:text-stone-300">Busy</span>
           <span class="font-mono text-2xl font-semibold {status.llm.busyPct > 80 ? 'text-amber-600 dark:text-amber-400' : ''}">

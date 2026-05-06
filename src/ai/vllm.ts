@@ -43,4 +43,15 @@ export class VllmProvider extends InferenceProvider {
     if (!first) throw new Error('[ai] /v1/models returned an empty list')
     return first
   }
+
+  /** vLLM exposes a dedicated `/health` endpoint at the server root that returns 200 when ready. */
+  protected async probeHealth(timeoutMs: number): Promise<boolean> {
+    const baseUrl = this.config.url.replace(/\/v1\/?$/, '')
+    try {
+      const res = await fetchWithTimeout(`${baseUrl}/health`, { headers: this.headers }, timeoutMs)
+      return res.ok
+    } catch {
+      return false
+    }
+  }
 }

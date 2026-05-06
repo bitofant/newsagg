@@ -132,6 +132,22 @@ export function applySchema(db: DatabaseSync): void {
     CREATE INDEX IF NOT EXISTS idx_user_read_topics_user ON user_read_topics(user_id);
   `)
 
+  // Pre-consolidation ingest queue: grabber writes here synchronously, consolidator drains.
+  // Decouples grabber → consolidator durability from in-memory state so a kill mid-drain or
+  // an LLM outage does not lose articles. Unique on `url` so re-polling the same RSS feed is
+  // a no-op; rows are deleted only after the consolidator has fully processed them.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ingest_queue (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      source     TEXT NOT NULL,
+      url        TEXT NOT NULL UNIQUE,
+      title      TEXT NOT NULL,
+      text       TEXT NOT NULL,
+      fetched_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_ingest_queue_id ON ingest_queue(id);
+  `)
+
   // Duplicate-topic candidates (regenerated on demand) and permanent dismissals.
   // Pair is canonicalized so topic_id_a < topic_id_b — prevents (A,B) and (B,A) both existing.
   // FK to topics(id) plus a manual cascade in deleteTopic() keep these in sync with the topic

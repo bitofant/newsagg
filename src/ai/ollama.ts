@@ -30,4 +30,9 @@ export class OllamaProvider extends InferenceProvider {
       return false
     }
   }
+
+  /** Ollama has no `/health` — root `/` returns 200 when alive. Reuses `ping`. */
+  protected async probeHealth(timeoutMs: number): Promise<boolean> {
+    return this.ping(timeoutMs)
+  }
 }
