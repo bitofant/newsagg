@@ -16,6 +16,7 @@ import type { DupeFinder, DupeFinderStatus } from '../dupes/index.js'
 import type { ServerConfig } from '../config.js'
 
 const JWT_SECRET = loadJwtSecret()
+const TOKEN_EXPIRY = '730d' // ~2 years; personal app, infrequent re-login
 const STARTED_AT = Date.now()
 const BUILT_AT = statSync(fileURLToPath(import.meta.url)).mtimeMs
 
@@ -89,7 +90,7 @@ export async function createServer({ db, aggregator, consolidator, profiler, dup
 
     const passwordHash = await bcrypt.hash(password, 12)
     const user = db.users.createUser(email, passwordHash)
-    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' })
+    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: TOKEN_EXPIRY })
     return { token }
   })
 
@@ -103,7 +104,7 @@ export async function createServer({ db, aggregator, consolidator, profiler, dup
     const valid = await bcrypt.compare(password, user.passwordHash)
     if (!valid) return reply.status(401).send({ error: 'invalid credentials' })
 
-    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' })
+    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: TOKEN_EXPIRY })
     return { token }
   })
 

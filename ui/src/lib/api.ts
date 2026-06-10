@@ -1,8 +1,48 @@
+import { goto } from '$app/navigation'
+
 const BASE = '/api'
 
-function authHeaders(): Record<string, string> {
+/** Thrown when the server rejects our token (401). The session has already been
+ *  cleared and a redirect to /login kicked off by the time this surfaces. */
+export class SessionExpiredError extends Error {
+  constructor() {
+    super('Your session has expired. Please sign in again.')
+    this.name = 'SessionExpiredError'
+  }
+}
+
+let redirectingToLogin = false
+
+/** Clear the stale token and bounce to /login. Guarded so a burst of concurrent
+ *  401s (e.g. front page + topic list firing together) only triggers one redirect. */
+function handleSessionExpiry(): void {
+  logout()
+  if (redirectingToLogin) return
+  redirectingToLogin = true
+  void goto('/login')
+}
+
+/**
+ * Single chokepoint for authenticated API calls. Injects the bearer token,
+ * defaults JSON bodies to `Content-Type: application/json`, and turns a 401 into
+ * a logout + redirect (throwing SessionExpiredError) instead of letting each
+ * caller mis-report an expired session as its own specific failure.
+ *
+ * Auth-free endpoints (login/register, public /status) deliberately bypass this.
+ */
+async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers)
   const token = localStorage.getItem('token')
-  return token ? { Authorization: `Bearer ${token}` } : {}
+  if (token) headers.set('Authorization', `Bearer ${token}`)
+  if (init.body != null && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
+  const res = await fetch(`${BASE}${path}`, { ...init, headers })
+  if (res.status === 401) {
+    handleSessionExpiry()
+    throw new SessionExpiredError()
+  }
+  return res
 }
 
 export async function login(email: string, password: string): Promise<void> {
@@ -14,6 +54,7 @@ export async function login(email: string, password: string): Promise<void> {
   if (!res.ok) throw new Error((await res.json() as { error: string }).error)
   const { token } = await res.json() as { token: string }
   localStorage.setItem('token', token)
+  redirectingToLogin = false
 }
 
 export async function register(email: string, password: string): Promise<void> {
@@ -25,6 +66,7 @@ export async function register(email: string, password: string): Promise<void> {
   if (!res.ok) throw new Error((await res.json() as { error: string }).error)
   const { token } = await res.json() as { token: string }
   localStorage.setItem('token', token)
+  redirectingToLogin = false
 }
 
 export function logout(): void {
@@ -51,39 +93,27 @@ export interface FrontPage {
 }
 
 export async function getFrontPage(): Promise<FrontPage | null> {
-  const res = await fetch(`${BASE}/frontpage`, { headers: authHeaders() })
+  const res = await apiFetch('/frontpage')
   if (res.status === 204) return null
   if (!res.ok) throw new Error('Failed to load front page')
   return res.json() as Promise<FrontPage>
 }
 
 export async function requestFrontPage(): Promise<void> {
-  const res = await fetch(`${BASE}/frontpage`, { method: 'POST', headers: authHeaders() })
+  const res = await apiFetch('/frontpage', { method: 'POST' })
   if (!res.ok) throw new Error('Failed to request front page')
 }
 
 export async function setReadTopics(topicIds: number[]): Promise<void> {
-  await fetch(`${BASE}/readtopics`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ topicIds }),
-  })
+  await apiFetch('/readtopics', { method: 'POST', body: JSON.stringify({ topicIds }) })
 }
 
 export async function setTopicRead(topicId: number, read: boolean): Promise<void> {
-  await fetch(`${BASE}/readtopics/${topicId}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ read }),
-  })
+  await apiFetch(`/readtopics/${topicId}`, { method: 'PUT', body: JSON.stringify({ read }) })
 }
 
 export async function vote(articleId: number, vote: 1 | -1 | 0): Promise<void> {
-  await fetch(`${BASE}/vote`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ articleId, vote }),
-  })
+  await apiFetch('/vote', { method: 'POST', body: JSON.stringify({ articleId, vote }) })
 }
 
 export interface TopicArticle {
@@ -95,7 +125,7 @@ export interface TopicArticle {
 }
 
 export async function getTopicArticles(topicId: number): Promise<TopicArticle[]> {
-  const res = await fetch(`${BASE}/topics/${topicId}/articles`, { headers: authHeaders() })
+  const res = await apiFetch(`/topics/${topicId}/articles`)
   if (!res.ok) throw new Error('Failed to load articles')
   return res.json() as Promise<TopicArticle[]>
 }
@@ -113,7 +143,7 @@ export interface TopicDetail {
 }
 
 export async function getTopicDetail(topicId: number): Promise<TopicDetail | null> {
-  const res = await fetch(`${BASE}/topics/${topicId}`, { headers: authHeaders() })
+  const res = await apiFetch(`/topics/${topicId}`)
   if (res.status === 404) return null
   if (!res.ok) throw new Error('Failed to load topic')
   return res.json() as Promise<TopicDetail>
@@ -127,15 +157,14 @@ export interface TopicListEntry {
 }
 
 export async function listTopics(limit = 200): Promise<TopicListEntry[]> {
-  const res = await fetch(`${BASE}/topics?limit=${limit}`, { headers: authHeaders() })
+  const res = await apiFetch(`/topics?limit=${limit}`)
   if (!res.ok) throw new Error('Failed to load topics')
   return res.json() as Promise<TopicListEntry[]>
 }
 
 export async function mergeTopic(topicId: number, intoTopicId: number): Promise<{ winnerId: number; winnerTitle: string }> {
-  const res = await fetch(`${BASE}/topics/${topicId}/merge`, {
+  const res = await apiFetch(`/topics/${topicId}/merge`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ intoTopicId }),
   })
   if (!res.ok) throw new Error((await res.json().catch(() => ({ error: 'merge failed' })) as { error: string }).error)
@@ -143,19 +172,13 @@ export async function mergeTopic(topicId: number, intoTopicId: number): Promise<
 }
 
 export async function ungroupArticle(topicId: number, articleId: number): Promise<{ newTopicIds: number[] }> {
-  const res = await fetch(`${BASE}/topics/${topicId}/articles/${articleId}/ungroup`, {
-    method: 'POST',
-    headers: authHeaders(),
-  })
+  const res = await apiFetch(`/topics/${topicId}/articles/${articleId}/ungroup`, { method: 'POST' })
   if (!res.ok) throw new Error('Failed to ungroup article')
   return res.json() as Promise<{ newTopicIds: number[] }>
 }
 
 export async function startUnmerge(topicId: number): Promise<{ ok: boolean; alreadyRunning?: boolean }> {
-  const res = await fetch(`${BASE}/topics/${topicId}/unmerge`, {
-    method: 'POST',
-    headers: authHeaders(),
-  })
+  const res = await apiFetch(`/topics/${topicId}/unmerge`, { method: 'POST' })
   if (!res.ok) throw new Error('Failed to start unmerge')
   return res.json() as Promise<{ ok: boolean; alreadyRunning?: boolean }>
 }
@@ -167,9 +190,7 @@ export interface UnmergeResult {
 }
 
 export async function pollUnmergeResult(topicId: number, waitSec = 30): Promise<UnmergeResult> {
-  const res = await fetch(`${BASE}/topics/${topicId}/unmerge-result?wait=${waitSec}`, {
-    headers: authHeaders(),
-  })
+  const res = await apiFetch(`/topics/${topicId}/unmerge-result?wait=${waitSec}`)
   if (!res.ok) throw new Error('Failed to fetch unmerge result')
   return res.json() as Promise<UnmergeResult>
 }
@@ -187,10 +208,7 @@ export async function regenerateTopicSummary(
   topicId: number,
   callbacks: RegenStreamCallbacks,
 ): Promise<RegenSummaryResult> {
-  const res = await fetch(`${BASE}/topics/${topicId}/regenerate-summary`, {
-    method: 'POST',
-    headers: authHeaders(),
-  })
+  const res = await apiFetch(`/topics/${topicId}/regenerate-summary`, { method: 'POST' })
   if (!res.ok || !res.body) {
     throw new Error(`Regenerate failed: ${res.status}`)
   }
@@ -259,27 +277,26 @@ export interface DupeFinderStatus {
 }
 
 export async function listDupeCandidates(): Promise<{ candidates: DupeCandidate[]; status: DupeFinderStatus }> {
-  const res = await fetch(`${BASE}/dupes`, { headers: authHeaders() })
+  const res = await apiFetch('/dupes')
   if (!res.ok) throw new Error('Failed to load dupe candidates')
   return res.json() as Promise<{ candidates: DupeCandidate[]; status: DupeFinderStatus }>
 }
 
 export async function startDupeGeneration(): Promise<{ ok: boolean; alreadyRunning?: boolean }> {
-  const res = await fetch(`${BASE}/dupes/generate`, { method: 'POST', headers: authHeaders() })
+  const res = await apiFetch('/dupes/generate', { method: 'POST' })
   if (!res.ok) throw new Error('Failed to start dupe generation')
   return res.json() as Promise<{ ok: boolean; alreadyRunning?: boolean }>
 }
 
 export async function pollDupeStatus(waitSec = 30): Promise<DupeFinderStatus> {
-  const res = await fetch(`${BASE}/dupes/status?wait=${waitSec}`, { headers: authHeaders() })
+  const res = await apiFetch(`/dupes/status?wait=${waitSec}`)
   if (!res.ok) throw new Error('Failed to poll dupe status')
   return res.json() as Promise<DupeFinderStatus>
 }
 
 export async function dismissDupePair(topicIdA: number, topicIdB: number): Promise<void> {
-  const res = await fetch(`${BASE}/dupes/dismiss`, {
+  const res = await apiFetch('/dupes/dismiss', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ topicIdA, topicIdB }),
   })
   if (!res.ok) throw new Error((await res.json().catch(() => ({ error: 'dismiss failed' })) as { error: string }).error)
@@ -298,17 +315,13 @@ export interface PreferencesUpdate {
 }
 
 export async function getPreferences(): Promise<Preferences> {
-  const res = await fetch(`${BASE}/preferences`, { headers: authHeaders() })
+  const res = await apiFetch('/preferences')
   if (!res.ok) throw new Error('Failed to load preferences')
   return res.json() as Promise<Preferences>
 }
 
 export async function updatePreferences(update: PreferencesUpdate): Promise<Preferences> {
-  const res = await fetch(`${BASE}/preferences`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify(update),
-  })
+  const res = await apiFetch('/preferences', { method: 'PATCH', body: JSON.stringify(update) })
   if (!res.ok) throw new Error((await res.json() as { error: string }).error)
   return res.json() as Promise<Preferences>
 }
@@ -360,6 +373,11 @@ export function subscribeToFrontPage(
     es.onerror = () => {
       if (es?.readyState === EventSource.CLOSED) {
         es = null
+        // EventSource doesn't expose the HTTP status, so we can't tell a 401 from a
+        // dropped connection here. But a session expiry on any other call clears the
+        // token (see handleSessionExpiry); if it's gone, stop reconnecting instead of
+        // hammering the 401'd endpoint forever.
+        if (!localStorage.getItem('token')) return
         retryTimer = setTimeout(() => {
           retryDelay = Math.min(retryDelay * 2, 30_000)
           connect()
