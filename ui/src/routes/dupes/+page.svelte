@@ -6,6 +6,7 @@
     isLoggedIn,
     listDupeCandidates,
     startDupeGeneration,
+    cancelDupeGeneration,
     pollDupeStatus,
     dismissDupePair,
     mergeTopic,
@@ -13,13 +14,17 @@
     type DupeFinderStatus,
   } from '$lib/api'
   import { timeAgo } from '$lib/time'
-  import { ArrowLeft, ArrowRight, Loader2, Search, X, Merge } from 'lucide-svelte'
+  import { ArrowLeft, ArrowRight, Ban, Loader2, Search, X, Merge } from 'lucide-svelte'
 
   let candidates = $state<DupeCandidate[]>([])
   let status = $state<DupeFinderStatus>({ state: 'idle' })
   let loading = $state(true)
   let error = $state('')
   let busyPair = $state<{ key: string; kind: 'merge' | 'dismiss' } | null>(null)
+  let cancelling = $state(false)
+  // In-flight POST /dupes/generate, if this client is the one that started the scan.
+  // cancel() awaits it so a cancel can't reach the server before the run it means to stop.
+  let startPromise: Promise<unknown> | null = null
 
   function pairKey(c: DupeCandidate): string {
     return `${c.topicIdA}:${c.topicIdB}`
@@ -73,13 +78,32 @@
     error = ''
     status = { ...status, state: 'running', startedAt: Date.now() }
     try {
-      await startDupeGeneration()
+      startPromise = startDupeGeneration()
+      await startPromise
     } catch (e) {
       error = String(e)
       status = { state: 'error', error: String(e) }
       return
     }
     await pollUntilDone()
+  }
+
+  async function cancel() {
+    // Cancellation is server-side; this just asks the server to stop whichever run
+    // is in flight. The active poll will pick up the resulting 'cancelled' status.
+    if (status.state !== 'running' || cancelling) return
+    cancelling = true
+    try {
+      // generate() flips status to 'running' optimistically, so the Cancel button can be
+      // clicked before the server has even received the start. Wait for the start to land
+      // first, otherwise the cancel arrives with nothing in flight and silently no-ops.
+      await startPromise?.catch(() => {})
+      await cancelDupeGeneration()
+    } catch (e) {
+      error = String(e)
+    } finally {
+      cancelling = false
+    }
   }
 
   const SLIDE_MS = 300
@@ -144,6 +168,8 @@
       <span class="text-xs text-stone-500 dark:text-stone-400">
         Last scan {timeAgo(status.completedAt)} · {status.candidateCount ?? 0} pair{(status.candidateCount ?? 0) === 1 ? '' : 's'}
       </span>
+    {:else if status.state === 'cancelled' && status.completedAt}
+      <span class="text-xs text-stone-500 dark:text-stone-400">Scan cancelled {timeAgo(status.completedAt)}</span>
     {/if}
   </div>
 
@@ -163,6 +189,18 @@
         Generate candidates
       {/if}
     </button>
+
+    <!-- Driven solely by server-reported status, so it shows for any client while a
+         scan is in flight regardless of who started it. -->
+    {#if status.state === 'running'}
+      <button
+        onclick={cancel}
+        disabled={cancelling}
+        class="inline-flex items-center gap-2 px-4 py-2 border border-stone-300 dark:border-stone-700 text-stone-700 dark:text-stone-300 text-sm rounded hover:bg-stone-100 dark:hover:bg-stone-800 disabled:opacity-50"
+      >
+        <Ban size={16} /> {cancelling ? 'Cancelling…' : 'Cancel'}
+      </button>
+    {/if}
 
     {#if candidates.length > 0}
       <div class="flex items-center gap-2 flex-1 min-w-[12rem] max-w-md border border-stone-300 dark:border-stone-700 rounded px-2 py-1 bg-white dark:bg-stone-800">

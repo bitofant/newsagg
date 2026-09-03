@@ -269,7 +269,7 @@ export interface DupeCandidate {
 }
 
 export interface DupeFinderStatus {
-  state: 'idle' | 'running' | 'done' | 'error'
+  state: 'idle' | 'running' | 'done' | 'error' | 'cancelled'
   startedAt?: number
   completedAt?: number
   candidateCount?: number
@@ -286,6 +286,11 @@ export async function startDupeGeneration(): Promise<{ ok: boolean; alreadyRunni
   const res = await apiFetch('/dupes/generate', { method: 'POST' })
   if (!res.ok) throw new Error('Failed to start dupe generation')
   return res.json() as Promise<{ ok: boolean; alreadyRunning?: boolean }>
+}
+
+export async function cancelDupeGeneration(): Promise<void> {
+  const res = await apiFetch('/dupes/cancel', { method: 'POST' })
+  if (!res.ok) throw new Error('Failed to cancel dupe generation')
 }
 
 export async function pollDupeStatus(waitSec = 30): Promise<DupeFinderStatus> {

@@ -15,21 +15,25 @@ Both tables FK to `topics(id)`. The codebase doesn't use SQL `ON DELETE CASCADE`
 
 `createDupeFinder({ db, embedding, dupes }).generate()`:
 
-1. Coalesce concurrent calls: if a run is in flight, return the in-flight promise instead of starting a second.
+1. Coalesce concurrent calls: if a run is in flight, return the in-flight promise instead of starting a second. The in-flight handle is cleared off the returned promise (`p.then(clear, clear)`), **not** in `run()`'s `finally` — resetting it there would be clobbered by the `inflight = run()` assignment whenever `run()` settles synchronously, pinning the handle non-null and turning every later `generate()` into a silent no-op.
 2. Load all topic embeddings via `db.news.listAllTopicEmbeddings(model)` (only topics whose stored embedding matches the current model are considered).
 3. Load existing dismissals via `db.news.listDupeDismissalPairs()` into a `"a:b"` Set.
-4. Pairwise loop (`i < j`): cosine via the shared `dot()` helper in `src/embeddings/cosine.ts`. Drop pairs in the dismissals set.
-5. Sort by similarity desc, take the top `dupes.maxCandidates` regardless of absolute score.
+4. Pairwise loop (`i < j`): cosine via the shared `dot()` helper in `src/embeddings/cosine.ts`. Drop pairs in the dismissals set. The outer loop yields (`setImmediate`) roughly every 50ms so the run doesn't pin the event loop and so a cancel request can be received; at each yield it checks the cancel flag.
+5. Bounded top-K, not sort-everything: a pair is skipped outright once its similarity can no longer beat the current K-th best, and the working buffer is trimmed back to `dupes.maxCandidates` whenever it grows past `max(4K, 1024)`. Peak memory is `O(K)` and the final sort is trivial. Selection is still "top `dupes.maxCandidates` by similarity desc, regardless of absolute score" — materializing all n²/2 pairs first would be millions of objects and a multi-second, non-yielding sort at a few thousand topics.
 6. `db.news.replaceDupeCandidates(pairs)` runs in a single transaction: `DELETE FROM topic_dupe_candidates`, then `INSERT OR IGNORE` each pair guarded by `WHERE EXISTS (SELECT 1 FROM topics WHERE id = ?)` for both ids — so any topic deleted between the embedding-read and the insert is silently skipped instead of FK-erroring.
 
-Brute-force `O(n²)` is fine at the documented "thousands of topics" scale; pure CPU on 384-dim normalized vectors is sub-second. If topic count grows past ~50k revisit with sqlite-vec.
+Brute-force `O(n²)` is fine at the documented "thousands of topics" scale; pure CPU on 384-dim normalized vectors. At ~4k topics (8M pairs) a full scan takes several seconds of CPU — hence the periodic yield — not sub-second. Memory stays flat regardless of `n` thanks to the top-K trim. If topic count grows past ~50k revisit with sqlite-vec.
+
+### Cancellation (2026-06-10)
+`DupeFinder.cancel()` sets a server-side flag the run checks at each yield point; on cancel the run aborts **before** `replaceDupeCandidates`, so existing candidates are left intact and status goes to `cancelled` (not `done`/`error`). Because the flag and `status()` are server-side, any client can cancel a run started by any other, and the UI shows the Cancel button purely off `status.state === 'running'` (no client-local "I started it" gating). One ordering caveat: the UI flips to `running` optimistically before `POST /api/dupes/generate` returns, so `cancel()` in the page first awaits that pending start request — otherwise a fast click sends the cancel while nothing is in flight yet, where it silently no-ops and the run then proceeds to completion. There is intentionally no parallelism — the existing coalescing keeps it to one run at a time.
 
 ## API surface
 
 Server endpoints in `src/server/index.ts` (all auth-required except `/api/status`):
 
 - `POST /api/dupes/generate` — kicks off a fire-and-forget run, returns `{ ok: true, alreadyRunning?: true }`.
-- `GET /api/dupes/status?wait=<seconds>` — current `DupeFinderStatus`. Long-polls up to 60s, settling on the next state transition (mirrors the unmerge-result waiter pattern).
+- `POST /api/dupes/cancel` — requests cancellation of the in-flight run (server-side flag); no-op when idle. Returns `{ ok: true }`.
+- `GET /api/dupes/status?wait=<seconds>` — current `DupeFinderStatus`. Long-polls up to 60s, settling on the next state transition (mirrors the unmerge-result waiter pattern). A cancel resolves waiters with state `cancelled`.
 - `GET /api/dupes` — `{ candidates: DupeCandidate[]; status: DupeFinderStatus }`. Candidates joined with topic title + article counts, sorted by similarity desc.
 - `POST /api/dupes/dismiss` body `{ topicIdA, topicIdB }` — normalizes to `a < b`, atomically inserts into dismissals + deletes any matching candidate row.
 
