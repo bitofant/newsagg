@@ -496,6 +496,15 @@ export async function createServer({ db, aggregator, consolidator, profiler, dup
     return { ok: true }
   })
 
+  app.post('/api/dupes/cancel', async (req, reply) => {
+    const callerId = authenticate(req)
+    if (!callerId) return reply.status(401).send({ error: 'unauthorized' })
+
+    // Server-side: cancels whichever run is in flight, no matter who started it.
+    dupeFinder.cancel()
+    return { ok: true }
+  })
+
   app.get('/api/dupes/status', async (req, reply) => {
     const callerId = authenticate(req)
     if (!callerId) return reply.status(401).send({ error: 'unauthorized' })
